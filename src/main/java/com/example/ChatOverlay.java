@@ -141,22 +141,81 @@ public class ChatOverlay extends Overlay
             return null;
         }
 
-        // Clip to visible text areas and draw the background
-        List<Rectangle> textBounds = collectTextBounds();
-        if (!textBounds.isEmpty())
+        // If options are visible, build a special clip: (text rows) minus (icon rects)
+        Widget optContainer = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
+        if (optContainer != null && !optContainer.isHidden())
         {
-            Shape oldClip = g.getClip();
-            Area clipArea = new Area();
-            for (Rectangle r : textBounds)
+            Widget[] rows = getOptionRows(optContainer);
+            if (rows != null && rows.length > 0)
             {
-                clipArea.add(new Area(r));
+                java.util.List<Rectangle> textRowRects = new java.util.ArrayList<>();
+                java.util.List<Widget> ordered = new java.util.ArrayList<>();
+                for (Widget w : rows) if (w != null && !w.isHidden()) ordered.add(w);
+                ordered.sort((a, b) -> {
+                    Rectangle ra = a.getBounds(), rb = b.getBounds();
+                    int ay = (ra == null ? Integer.MAX_VALUE : ra.y);
+                    int by = (rb == null ? Integer.MAX_VALUE : rb.y);
+                    if (ay != by) return Integer.compare(ay, by);
+                    int ax = (ra == null ? Integer.MAX_VALUE : ra.x);
+                    int bx = (rb == null ? Integer.MAX_VALUE : rb.x);
+                    return Integer.compare(ax, bx);
+                });
+
+                int taken = 0;
+                for (Widget r : ordered)
+                {
+                    String raw = r.getText();
+                    String plain = stripTags(raw).trim();
+                    if (plain.isEmpty()) continue; // skip icons/empty slots
+
+                    Rectangle b = r.getBounds();
+                    if (b != null && b.width > 0 && b.height > 0)
+                    {
+                        textRowRects.add(b);
+                        if (++taken >= 6) break;
+                    }
+                }
+
+                java.util.List<Rectangle> iconRects = getOptionIconRects(optContainer);
+
+                if (!textRowRects.isEmpty())
+                {
+                    Shape oldClip = g.getClip();
+                    Area clipArea = new Area();
+                    for (Rectangle r : textRowRects) clipArea.add(new Area(r));
+                    for (Rectangle ir : iconRects) clipArea.subtract(new Area(ir)); // remove icon areas
+
+                    g.setClip(clipArea);
+
+                    Point bgLoc = chatBg.getCanvasLocation();
+                    g.drawImage(bg, bgLoc.getX(), bgLoc.getY(), null);
+
+                    g.setClip(oldClip);
+                }
             }
-            g.setClip(clipArea);
+        }
+        else
+        {
+            // Dialogue text/name/continue background clipping
+            java.util.List<Rectangle> rects = new java.util.ArrayList<>();
+            addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
+            addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
+            addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_NAME));
+            addWidgetBounds(rects, client.getWidget(231, 5)); // Continue (left)
+            addWidgetBounds(rects, client.getWidget(217, 5)); // Continue (right))
 
-            Point bgLoc = chatBg.getCanvasLocation();
-            g.drawImage(bg, bgLoc.getX(), bgLoc.getY(), null);
+            if (!rects.isEmpty())
+            {
+                Shape oldClip = g.getClip();
+                Area clipArea = new Area();
+                for (Rectangle r : rects) clipArea.add(new Area(r));
+                g.setClip(clipArea);
 
-            g.setClip(oldClip);
+                Point bgLoc = chatBg.getCanvasLocation();
+                g.drawImage(bg, bgLoc.getX(), bgLoc.getY(), null);
+
+                g.setClip(oldClip);
+            }
         }
 
         // Draw per-widget translations (including those inside grace window)
@@ -166,19 +225,6 @@ public class ChatOverlay extends Overlay
         }
 
         return null;
-    }
-
-    private List<Rectangle> collectTextBounds()
-    {
-        List<Rectangle> rects = new ArrayList<>();
-        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
-        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
-        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_NAME));
-        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_OPTION));
-        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_SPRITE_TEXT));
-        addWidgetBounds(rects, client.getWidget(231, 5)); // Continue (left)
-        addWidgetBounds(rects, client.getWidget(217, 5)); // Continue (right)
-        return rects;
     }
 
     private void addWidgetBounds(List<Rectangle> rects, Widget w)
@@ -193,6 +239,14 @@ public class ChatOverlay extends Overlay
         }
     }
 
+    private Widget[] getOptionRows(Widget container)
+    {
+        Widget[] rows = container.getDynamicChildren();
+        if (rows == null || rows.length == 0) rows = container.getChildren();
+        if (rows == null || rows.length == 0) rows = container.getStaticChildren();
+        return rows;
+    }
+
     private void drawPerWidget(Graphics2D g)
     {
         Font rsBase = FontManager.getRunescapeFont();
@@ -204,23 +258,90 @@ public class ChatOverlay extends Overlay
         int rsAscent = rsFM.getAscent();
         int lineHeight = rsAscent + rsFM.getDescent();
 
+        // 1) Options container special-case: draw combined translation split across TEXT rows only
+        Widget optContainer = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
+        if (optContainer != null && !optContainer.isHidden())
+        {
+            String combined = translatedById.get(optContainer.getId());
+            if (combined != null && !combined.isEmpty())
+            {
+                Widget[] rowArr = getOptionRows(optContainer);
+                if (rowArr != null && rowArr.length > 0)
+                {
+                    // Build ordered rows, filter to TEXT rows (skip icons/empties)
+                    List<Widget> textRows = new ArrayList<>();
+                    for (Widget w : rowArr)
+                    {
+                        if (w == null || w.isHidden()) continue;
+                        String raw = w.getText();
+                        if (raw == null || stripTags(raw).trim().isEmpty()) continue; // skip icon rows
+                        textRows.add(w);
+                    }
+                    textRows.sort((a, b) -> {
+                        Rectangle ra = a.getBounds(), rb = b.getBounds();
+                        int ay = (ra == null ? Integer.MAX_VALUE : ra.y);
+                        int by = (rb == null ? Integer.MAX_VALUE : rb.y);
+                        if (ay != by) return Integer.compare(ay, by);
+                        int ax = (ra == null ? Integer.MAX_VALUE : ra.x);
+                        int bx = (rb == null ? Integer.MAX_VALUE : rb.x);
+                        return Integer.compare(ax, bx);
+                    });
+
+                    if (!textRows.isEmpty())
+                    {
+                        // Clip to union of TEXT row rects
+                        Shape oldClip = g.getClip();
+                        Area union = new Area();
+                        for (int i = 0; i < Math.min(textRows.size(), 6); i++)
+                        {
+                            Rectangle rb = textRows.get(i).getBounds();
+                            if (rb != null && rb.width > 0 && rb.height > 0) union.add(new Area(rb));
+                        }
+                        g.setClip(union);
+
+                        String[] lines = combined.split("\\R", -1);
+                        int count = Math.min(lines.length, textRows.size());
+                        for (int i = 0; i < Math.min(count, 6); i++)
+                        {
+                            Widget r = textRows.get(i);
+                            Rectangle rb = r.getBounds();
+                            if (rb == null || rb.isEmpty()) continue;
+
+                            java.awt.Color color;
+                            try { color = new java.awt.Color(r.getTextColor()); } catch (Exception e) { color = java.awt.Color.WHITE; }
+                            g.setColor(color);
+
+                            String text = lines[i].trim();
+                            int wpx = measureMixedWidth(text, rsFM, cyrFM);
+                            int x = rb.x + Math.max(0, (rb.width - wpx) / 2);
+                            int y = rb.y + rsAscent;
+
+                            drawMixed(g, text, x, y, rsFont, cyrFont, rsFM, cyrFM);
+                        }
+
+                        g.setClip(oldClip);
+                    }
+                }
+            }
+        }
+
+        // 2) Regular per-widget drawing for everything else
         for (Widget w : sourceWidgets)
         {
             if (w == null || w.isHidden()) continue;
+
             int id = w.getId();
+            int grp = (id >>> 16), child = (id & 0xFFFF);
+
+            // Skip the options container here to avoid double drawing; it was handled above
+            if (grp == 219 && child == 1) continue;
+
             String translated = translatedById.get(id);
-            if (translated == null || translated.isEmpty())
-            {
-                continue;
-            }
+            if (translated == null || translated.isEmpty()) continue;
 
             Rectangle wb = w.getBounds();
-            if (wb == null || wb.isEmpty())
-            {
-                continue;
-            }
+            if (wb == null || wb.isEmpty()) continue;
 
-            // Slightly relaxed clip to avoid shaving off bottom baseline
             Rectangle clipRect = new Rectangle(wb.x, wb.y, wb.width, wb.height + 2);
             Shape oldClip = g.getClip();
             g.setClip(clipRect);
@@ -229,12 +350,12 @@ public class ChatOverlay extends Overlay
             try { color = new java.awt.Color(w.getTextColor()); } catch (Exception e) { color = java.awt.Color.WHITE; }
             g.setColor(color);
 
-            boolean isLeftName     = (id >>> 16) == 231 && (id & 0xFFFF) == 4;
-            boolean isLeftText     = (id >>> 16) == 231 && (id & 0xFFFF) == 6;
-            boolean isLeftContinue = (id >>> 16) == 231 && (id & 0xFFFF) == 5;
-            boolean isRightName     = (id >>> 16) == 217 && (id & 0xFFFF) == 4;
-            boolean isRightText     = (id >>> 16) == 217 && (id & 0xFFFF) == 6;
-            boolean isRightContinue = (id >>> 16) == 217 && (id & 0xFFFF) == 5;
+            boolean isLeftName     = grp == 231 && child == 4;
+            boolean isLeftText     = grp == 231 && child == 6;
+            boolean isLeftContinue = grp == 231 && child == 5;
+            boolean isRightName     = grp == 217 && child == 4;
+            boolean isRightText     = grp == 217 && child == 6;
+            boolean isRightContinue = grp == 217 && child == 5;
 
             boolean isName = isLeftName || isRightName;
             boolean isText = isLeftText || isRightText;
@@ -242,8 +363,6 @@ public class ChatOverlay extends Overlay
 
             Point p = w.getCanvasLocation();
             int baseTopY = (p != null ? p.getY() : wb.y) + rsAscent;
-
-            // Nudge baseline up by 1 px when bottom-anchored to avoid rounding clip
             int y = isContinue ? (wb.y + wb.height - rsFM.getDescent() - 1) : baseTopY;
 
             if (isName)
@@ -288,8 +407,41 @@ public class ChatOverlay extends Overlay
         }
     }
 
-    // Wrapping and drawing helpers
+    // Collect rectangles of icon widgets inside the options container
+    private java.util.List<Rectangle> getOptionIconRects(Widget optContainer)
+    {
+        java.util.List<Rectangle> icons = new java.util.ArrayList<>();
+        Widget[] all = getOptionRows(optContainer);
+        if (all == null) return icons;
 
+        for (Widget w : all)
+        {
+            if (w == null || w.isHidden()) continue;
+
+            boolean looksLikeIcon = false;
+            try
+            {
+                int spriteId = w.getSpriteId();
+                looksLikeIcon = spriteId != -1;
+            }
+            catch (Throwable ignored)
+            {
+                String raw = w.getText();
+                looksLikeIcon = (raw == null || stripTags(raw).trim().isEmpty());
+            }
+
+            if (!looksLikeIcon) continue;
+
+            Rectangle b = w.getBounds();
+            if (b != null && b.width > 0 && b.height > 0)
+            {
+                icons.add(b);
+            }
+        }
+        return icons;
+    }
+
+    // Wrapping and drawing helpers
     private List<String> wrapToWidth(String text, int maxWidth, FontMetrics rsFM, FontMetrics cyrFM)
     {
         if (text == null || text.isEmpty())
@@ -362,6 +514,11 @@ public class ChatOverlay extends Overlay
             parts.add(part.toString());
         }
         return parts;
+    }
+
+    private String stripTags(String str)
+    {
+        return str.replaceAll("<[^>]*>", "");
     }
 
     private int measureMixedWidth(String text, FontMetrics rsFM, FontMetrics cyrFM)
