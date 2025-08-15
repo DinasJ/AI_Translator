@@ -174,14 +174,6 @@ public class AITranslatorPlugin extends Plugin
                 String combinedPlain = collectOptionsPlain(optionsContainer);
                 int cid = optionsContainer.getId();
 
-                if (DEBUG)
-                {
-                    Rectangle b = optionsContainer.getBounds();
-                    log.info("Options visible: container id={} grp={} child={} len={} bounds={}",
-                            cid, (cid >>> 16), (cid & 0xFFFF), combinedPlain.length(),
-                            (b == null ? "null" : (b.x + "," + b.y + " " + b.width + "x" + b.height)));
-                }
-
                 if (!combinedPlain.isEmpty())
                 {
                     String last = lastPlainById.get(cid);
@@ -192,6 +184,8 @@ public class AITranslatorPlugin extends Plugin
                         String cached = translationCache.get(combinedPlain);
                         if (cached != null)
                         {
+                            // Seed per-line cache from cached combined text as well
+                            seedPerLineCache(combinedPlain, cached);
                             if (DEBUG) log.info("Options cache hit id={} -> '{}'", cid, truncate(cached));
                             chatOverlay.setTranslation(cid, cached);
                         }
@@ -201,15 +195,28 @@ public class AITranslatorPlugin extends Plugin
                             final String lang = config.targetLang();
                             translator.translateAsync(combinedPlain, lang, translated ->
                             {
+                                // Store combined + per-line
                                 translationCache.put(combinedPlain, translated);
+                                seedPerLineCache(combinedPlain, translated);
                                 cacheDirty = true;
                                 clientThread.invokeLater(() -> chatOverlay.setTranslation(cid, translated));
                             });
                         }
                     }
-                    else if (DEBUG)
+                    else
                     {
-                        log.info("Options unchanged id={}, keep existing translation", cid);
+                        // UNCHANGED: re-assert combined and ensure per-line cache is seeded
+                        String cached = translationCache.get(combinedPlain);
+                        if (cached != null)
+                        {
+                            seedPerLineCache(combinedPlain, cached);
+                            if (DEBUG) log.info("Options unchanged id={} -> re-assert combined + per-line cache", cid);
+                            chatOverlay.setTranslation(cid, cached);
+                        }
+                        else if (DEBUG)
+                        {
+                            log.info("Options unchanged id={} but no combined cache; skip re-assert", cid);
+                        }
                     }
                 }
                 else if (DEBUG)
@@ -221,6 +228,68 @@ public class AITranslatorPlugin extends Plugin
             // Detect reappeared ids (present now, not present previously)
             Set<Integer> appeared = new HashSet<>(presentIds);
             appeared.removeAll(prevPresentIds);
+
+            // Re-assert translations for all newly appeared widgets (not only options)
+            for (Widget w : widgets)
+            {
+                if (w == null || w.isHidden()) continue;
+                int id = w.getId();
+                if (!appeared.contains(id)) continue;
+
+                String raw = w.getText();
+                if (raw == null) raw = "";
+                String plain = stripTags(raw).trim();
+
+                // Skip the player's own name on name widgets
+                if (isNameWidget(w) && isLocalPlayerName(plain))
+                {
+                    if (DEBUG) log.info("Appeared player name id={} -> skip translation", id);
+                    chatOverlay.setTranslation(id, "");
+                    continue;
+                }
+
+                if (plain.isEmpty())
+                {
+                    if (DEBUG) log.info("Appeared id={} but plain text empty; defer", id);
+                    continue;
+                }
+
+                // Push cached translation immediately if present
+                String cached = translationCache.get(plain);
+                if (cached != null)
+                {
+                    if (DEBUG) log.info("Appeared id={} -> re-assert cached '{}'", id, truncate(cached));
+                    chatOverlay.setTranslation(id, cached);
+                    // Also remember last plain to keep 'unchanged' branch stable
+                    lastPlainById.put(id, plain);
+                    continue;
+                }
+
+                // No cache yet -> request translation
+                if (DEBUG) log.info("Appeared id={} -> request translate '{}'", id, truncate(plain));
+                final String lang = config.targetLang();
+                final int wid = id;
+                final String currentPlain = plain;
+
+                translator.translateAsync(currentPlain, lang, translated ->
+                {
+                    translationCache.put(currentPlain, translated);
+                    cacheDirty = true;
+                    clientThread.invokeLater(() ->
+                    {
+                        // Only apply if widget's current plain still matches
+                        String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
+                        if (!currentPlain.equals(still))
+                        {
+                            if (DEBUG) log.info("Skip stale re-appear apply id={} expected='{}' got='{}'",
+                                    wid, truncate(currentPlain), truncate(still));
+                            return;
+                        }
+                        chatOverlay.setTranslation(wid, translated);
+                        lastPlainById.put(wid, currentPlain);
+                    });
+                });
+            }
 
             // Main loop: translate new/changed text for non-options widgets (skip player name)
             for (Widget w : widgets)
@@ -259,17 +328,25 @@ public class AITranslatorPlugin extends Plugin
                 String last = lastPlainById.get(id);
                 if (plain.equals(last))
                 {
-                    if (DEBUG)
+                    String cached = translationCache.get(plain);
+                    if (cached != null)
                     {
-                        log.info("No change for id={} grp={} child={}, keep existing translation",
-                                id, grp, child);
+                        if (DEBUG)
+                        {
+                            log.info("No change for id={} grp={} child={} -> re-assert cached translation",
+                                    id, grp, child);
+                        }
+                        chatOverlay.setTranslation(id, cached);
+                    }
+                    else if (DEBUG)
+                    {
+                        log.info("No change for id={} grp={} child={}, no cache available", id, grp, child);
                     }
                     continue;
                 }
 
                 lastPlainById.put(id, plain);
 
-                // Serve from cache
                 String cached = translationCache.get(plain);
                 if (cached != null)
                 {
@@ -303,7 +380,7 @@ public class AITranslatorPlugin extends Plugin
                     cacheDirty = true;
                     clientThread.invokeLater(() ->
                     {
-                        String still = lastPlainById.get(wid);
+                        String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
                         if (!currentPlain.equals(still))
                         {
                             if (DEBUG)
@@ -653,6 +730,29 @@ public class AITranslatorPlugin extends Plugin
         {
             log.error("Failed to save cache: {}", e.getMessage());
         }
+    }
+
+    // Seed per-line cache from the combined options strings (keeps click-through panels consistent)
+    private void seedPerLineCache(String combinedPlain, String combinedTranslated)
+    {
+        if (combinedPlain == null || combinedTranslated == null) return;
+        String[] src = combinedPlain.split("\\R");
+        String[] dst = combinedTranslated.split("\\R");
+        if (src.length != dst.length) return; // mismatch: avoid wrong mappings
+
+        boolean any = false;
+        for (int i = 0; i < src.length; i++)
+        {
+            String s = src[i].trim();
+            String t = dst[i].trim();
+            if (s.isEmpty() || t.isEmpty()) continue;
+            if (!t.equals(translationCache.get(s)))
+            {
+                translationCache.put(s, t);
+                any = true;
+            }
+        }
+        if (any) cacheDirty = true;
     }
 
     // Update all places where you put items into translationCache to set cacheDirty = true

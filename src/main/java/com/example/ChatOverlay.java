@@ -165,9 +165,8 @@ public class ChatOverlay extends Overlay
                 for (Widget r : ordered)
                 {
                     String raw = r.getText();
-                    String plain = stripTags(raw).trim();
+                    String plain = stripTags(raw);
                     if (plain.isEmpty()) continue; // skip icons/empty slots
-
                     Rectangle b = r.getBounds();
                     if (b != null && b.width > 0 && b.height > 0)
                     {
@@ -196,14 +195,8 @@ public class ChatOverlay extends Overlay
         }
         else
         {
-            // Dialogue text/name/continue background clipping
-            java.util.List<Rectangle> rects = new java.util.ArrayList<>();
-            addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
-            addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
-            addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_NAME));
-            addWidgetBounds(rects, client.getWidget(231, 5)); // Continue (left)
-            addWidgetBounds(rects, client.getWidget(217, 5)); // Continue (right))
-
+            // Dialogue text/name/continue background clipping (non-options)
+            java.util.List<Rectangle> rects = collectTextBounds();
             if (!rects.isEmpty())
             {
                 Shape oldClip = g.getClip();
@@ -225,6 +218,18 @@ public class ChatOverlay extends Overlay
         }
 
         return null;
+    }
+
+    // Dialogue fallback text bounds (non-options)
+    private java.util.List<Rectangle> collectTextBounds()
+    {
+        java.util.List<Rectangle> rects = new java.util.ArrayList<>();
+        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
+        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
+        addWidgetBounds(rects, client.getWidget(WidgetInfo.DIALOG_NPC_NAME));
+        addWidgetBounds(rects, client.getWidget(231, 5)); // Continue (left)
+        addWidgetBounds(rects, client.getWidget(217, 5)); // Continue (right)
+        return rects;
     }
 
     private void addWidgetBounds(List<Rectangle> rects, Widget w)
@@ -289,7 +294,7 @@ public class ChatOverlay extends Overlay
 
                     if (!textRows.isEmpty())
                     {
-                        // Clip to union of TEXT row rects
+                        // Clip to union of TEXT row rects and subtract icon rects
                         Shape oldClip = g.getClip();
                         Area union = new Area();
                         for (int i = 0; i < Math.min(textRows.size(), 6); i++)
@@ -297,6 +302,7 @@ public class ChatOverlay extends Overlay
                             Rectangle rb = textRows.get(i).getBounds();
                             if (rb != null && rb.width > 0 && rb.height > 0) union.add(new Area(rb));
                         }
+                        for (Rectangle ir : getOptionIconRects(optContainer)) union.subtract(new Area(ir));
                         g.setClip(union);
 
                         String[] lines = combined.split("\\R", -1);
@@ -311,10 +317,11 @@ public class ChatOverlay extends Overlay
                             try { color = new java.awt.Color(r.getTextColor()); } catch (Exception e) { color = java.awt.Color.WHITE; }
                             g.setColor(color);
 
+                            // Center each single-line vertically in its row rect
                             String text = lines[i].trim();
                             int wpx = measureMixedWidth(text, rsFM, cyrFM);
                             int x = rb.x + Math.max(0, (rb.width - wpx) / 2);
-                            int y = rb.y + rsAscent;
+                            int y = rb.y + Math.max(0, (rb.height - lineHeight) / 2) + rsAscent;
 
                             drawMixed(g, text, x, y, rsFont, cyrFont, rsFM, cyrFM);
                         }
@@ -361,22 +368,26 @@ public class ChatOverlay extends Overlay
             boolean isText = isLeftText || isRightText;
             boolean isContinue = isLeftContinue || isRightContinue;
 
-            Point p = w.getCanvasLocation();
-            int baseTopY = (p != null ? p.getY() : wb.y) + rsAscent;
-            int y = isContinue ? (wb.y + wb.height - rsFM.getDescent() - 1) : baseTopY;
-
-            if (isName)
+            if (isName || isContinue)
             {
+                // Single-line: center vertically within widget bounds
                 String row = translated.trim();
                 int wpx = measureMixedWidth(row, rsFM, cyrFM);
                 int x = wb.x + Math.max(0, (wb.width - wpx) / 2);
+                int y = wb.y + Math.max(0, (wb.height - lineHeight) / 2) + rsAscent;
                 drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
             }
             else if (isText)
             {
+                // Multi-line body: compute total block height and center vertically
                 List<String> rows = wrapToWidth(translated, Math.max(1, wb.width), rsFM, cyrFM);
-                for (String row : rows)
+                int n = rows.size();
+                int totalBlockH = n * lineHeight + Math.max(0, (n - 1) * CENTERED_LINE_GAP);
+                int y = wb.y + Math.max(0, (wb.height - totalBlockH) / 2) + rsAscent;
+
+                for (int i = 0; i < rows.size(); i++)
                 {
+                    String row = rows.get(i);
                     int wpx = measureMixedWidth(row, rsFM, cyrFM);
                     int x = wb.x + Math.max(0, (wb.width - wpx) / 2);
                     drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
@@ -384,17 +395,14 @@ public class ChatOverlay extends Overlay
                     if (y > wb.y + wb.height + 1) break;
                 }
             }
-            else if (isContinue)
-            {
-                String row = translated.trim();
-                int wpx = measureMixedWidth(row, rsFM, cyrFM);
-                int x = wb.x + Math.max(0, (wb.width - wpx) / 2);
-                drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
-            }
             else
             {
+                // Fallback: left-anchored multi-line, but center vertically as a block
                 List<String> rows = wrapToWidth(translated, Math.max(1, wb.width), rsFM, cyrFM);
-                int x = (p != null ? p.getX() : wb.x);
+                int n = rows.size();
+                int totalBlockH = n * lineHeight;
+                int y = wb.y + Math.max(0, (wb.height - totalBlockH) / 2) + rsAscent;
+                int x = (w.getCanvasLocation() != null ? w.getCanvasLocation().getX() : wb.x);
                 for (String row : rows)
                 {
                     drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
@@ -439,6 +447,12 @@ public class ChatOverlay extends Overlay
             }
         }
         return icons;
+    }
+
+    private String stripTags(String str)
+    {
+        if (str == null) return "";
+        return str.replaceAll("<[^>]*>", "").trim();
     }
 
     // Wrapping and drawing helpers
@@ -514,11 +528,6 @@ public class ChatOverlay extends Overlay
             parts.add(part.toString());
         }
         return parts;
-    }
-
-    private String stripTags(String str)
-    {
-        return str.replaceAll("<[^>]*>", "");
     }
 
     private int measureMixedWidth(String text, FontMetrics rsFM, FontMetrics cyrFM)
