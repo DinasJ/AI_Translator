@@ -1,7 +1,9 @@
 package com.example;
 
 import net.runelite.api.Client;
+import net.runelite.api.Point;
 import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.game.SpriteManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
@@ -16,6 +18,8 @@ import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.geom.Area;
 import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Draw a background image from widget 162,36, but only underneath
@@ -39,75 +43,64 @@ public class ChatOverlay extends Overlay
         setLayer(OverlayLayer.ABOVE_WIDGETS);
     }
 
+    private void addWidgetBounds(List<Rectangle> rects, Widget w)
+    {
+        if (w != null && !w.isHidden())
+        {
+            Rectangle r = w.getBounds();
+            if (r != null && !r.isEmpty())
+            {
+                rects.add(r);
+            }
+        }
+    }
+
     @Override
     public Dimension render(Graphics2D g)
     {
-        // Background widget 162.36[0]
-        // Background widget 162.36[0]
         Widget chatBgParent = client.getWidget(162, 36);
         if (chatBgParent == null || chatBgParent.isHidden())
         {
             return null;
         }
-
         Widget chatBg = chatBgParent.getChild(0);
         if (chatBg == null || chatBg.isHidden())
         {
             return null;
         }
 
-        // Detect if head is left or right by checking left/right portrait containers
-        boolean headLeft = false;
-        final Widget leftHead = client.getWidget(231, 2);
-        final Widget rightHead = client.getWidget(217, 2);
-        if (leftHead != null && !leftHead.isHidden())
-        {
-            headLeft = true;
-        }
-
-        // Load background sprite from SpriteManager (archive=spriteId, file=0)
-        final int spriteId = chatBg.getSpriteId();
-        if (spriteId == -1)
+        BufferedImage bg = spriteManager.getSprite(chatBg.getSpriteId(), 0);
+        if (bg == null)
         {
             return null;
         }
 
-        final BufferedImage bgImage = spriteManager.getSprite(spriteId, 0);
-        if (bgImage == null)
+        List<Rectangle> textBounds = new ArrayList<>();
+        addWidgetBounds(textBounds, client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
+        addWidgetBounds(textBounds, client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
+        addWidgetBounds(textBounds, client.getWidget(WidgetInfo.DIALOG_NPC_NAME));
+        addWidgetBounds(textBounds, client.getWidget(WidgetInfo.DIALOG_OPTION));
+        addWidgetBounds(textBounds, client.getWidget(WidgetInfo.DIALOG_SPRITE_TEXT));
+        addWidgetBounds(textBounds, client.getWidget(231, 5)); // ChatLeft.Continue
+        addWidgetBounds(textBounds, client.getWidget(217, 5)); // ChatRight.Continue
+
+        if (textBounds.isEmpty())
         {
             return null;
         }
 
-        // Crop off the portrait side of the chat background
-        final int cropWidth = (int) (bgImage.getWidth() * 0.245);
-        final BufferedImage cropped = headLeft
-                ? bgImage.getSubimage(cropWidth, 0, bgImage.getWidth() - cropWidth, bgImage.getHeight())
-                : bgImage.getSubimage(0, 0, bgImage.getWidth() - cropWidth, bgImage.getHeight());
-
-        // Figure out where to draw the background: use bounds as reliable position
-        final Rectangle bgBounds = chatBg.getBounds();
-        if (bgBounds == null)
+        Shape oldClip = g.getClip();
+        Area clipArea = new Area();
+        for (Rectangle r : textBounds)
         {
-            return null;
+            clipArea.add(new Area(r));
         }
+        g.setClip(clipArea);
 
-        final int drawX = bgBounds.x + (headLeft ? cropWidth : 0);
-        final int drawY = bgBounds.y;
+        Point bgLoc = chatBg.getCanvasLocation();
+        g.drawImage(bg, bgLoc.getX(), bgLoc.getY(), null);
 
-        // Build a clip consisting only of the union of visible text widget areas
-        final Shape oldClip = g.getClip();
-        final Area textArea = buildTextArea(g);
-        if (!textArea.isEmpty())
-        {
-            g.setClip(textArea);
-        }
-
-        // Draw cropped background in place of chatbox, but only where text is visible
-        g.drawImage(cropped, drawX, drawY, null);
-
-        // Restore clip
         g.setClip(oldClip);
-
         return null;
     }
 
