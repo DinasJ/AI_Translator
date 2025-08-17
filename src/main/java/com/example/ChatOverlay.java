@@ -20,6 +20,7 @@ import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.geom.Area;
 import java.awt.image.BufferedImage;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -51,8 +52,13 @@ public class ChatOverlay extends Overlay
     // Last seen tick per widget id (to implement grace TTL)
     private final Map<Integer, Integer> lastSeenTickById = new ConcurrentHashMap<>();
 
-    private static final float SCALE = 0.90f;
-    private static final int CENTERED_LINE_GAP = 2;
+    private static final float SCALE = 1f;
+    private static final int CENTERED_LINE_GAP = 1;
+
+    // Path inside resources for your custom font (place file at src/main/resources/fonts/MyFont.ttf)
+    private static final String CUSTOM_FONT_RESOURCE = "/fonts/Runescape-Quill-8-ru.ttf";
+    // Cached base font (unscaled). If loading fails, will fallback to Arial.
+    private Font customBaseFont;
 
     @Inject
     public ChatOverlay(Client client, SpriteManager spriteManager)
@@ -255,11 +261,11 @@ public class ChatOverlay extends Overlay
     private void drawPerWidget(Graphics2D g)
     {
         Font rsBase = FontManager.getRunescapeFont();
-        Font cyrBase = new Font("Arial", Font.PLAIN, rsBase.getSize());
+        Font customBase = getCustomBaseFontOrFallback(rsBase.getSize());
         Font rsFont = rsBase.deriveFont(rsBase.getSize2D() * SCALE);
-        Font cyrFont = cyrBase.deriveFont(cyrBase.getSize2D() * SCALE);
+        Font customFont = customBase.deriveFont(customBase.getSize2D() * SCALE);
         FontMetrics rsFM = g.getFontMetrics(rsFont);
-        FontMetrics cyrFM = g.getFontMetrics(cyrFont);
+        FontMetrics cyrFM = g.getFontMetrics(customFont);
         int rsAscent = rsFM.getAscent();
         int lineHeight = rsAscent + rsFM.getDescent();
 
@@ -323,7 +329,7 @@ public class ChatOverlay extends Overlay
                             int x = rb.x + Math.max(0, (rb.width - wpx) / 2);
                             int y = rb.y + Math.max(0, (rb.height - lineHeight) / 2) + rsAscent;
 
-                            drawMixed(g, text, x, y, rsFont, cyrFont, rsFM, cyrFM);
+                            drawMixed(g, text, x, y, rsFont, customFont, rsFM, cyrFM);
                         }
 
                         g.setClip(oldClip);
@@ -375,7 +381,7 @@ public class ChatOverlay extends Overlay
                 int wpx = measureMixedWidth(row, rsFM, cyrFM);
                 int x = wb.x + Math.max(0, (wb.width - wpx) / 2);
                 int y = wb.y + Math.max(0, (wb.height - lineHeight) / 2) + rsAscent;
-                drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
+                drawMixed(g, row, x, y, rsFont, customFont, rsFM, cyrFM);
             }
             else if (isText)
             {
@@ -390,7 +396,7 @@ public class ChatOverlay extends Overlay
                     String row = rows.get(i);
                     int wpx = measureMixedWidth(row, rsFM, cyrFM);
                     int x = wb.x + Math.max(0, (wb.width - wpx) / 2);
-                    drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
+                    drawMixed(g, row, x, y, rsFont, customFont, rsFM, cyrFM);
                     y += lineHeight + CENTERED_LINE_GAP;
                     if (y > wb.y + wb.height + 1) break;
                 }
@@ -405,7 +411,7 @@ public class ChatOverlay extends Overlay
                 int x = (w.getCanvasLocation() != null ? w.getCanvasLocation().getX() : wb.x);
                 for (String row : rows)
                 {
-                    drawMixed(g, row, x, y, rsFont, cyrFont, rsFM, cyrFM);
+                    drawMixed(g, row, x, y, rsFont, customFont, rsFM, cyrFM);
                     y += lineHeight;
                     if (y > wb.y + wb.height + 1) break;
                 }
@@ -530,14 +536,29 @@ public class ChatOverlay extends Overlay
         return parts;
     }
 
+    /**
+     * Measure width of mixed text using cyrillic font metrics for Cyrillic letters and punctuation,
+     * and the runescape font metrics for (Latin) letters and digits.
+     */
     private int measureMixedWidth(String text, FontMetrics rsFM, FontMetrics cyrFM)
     {
         int w = 0;
         for (int i = 0; i < text.length(); i++)
         {
             char c = text.charAt(i);
-            if (isCyrillic(c)) w += cyrFM.charWidth(c);
-            else w += rsFM.charWidth(c);
+            if (isCyrillic(c) || isPunctuation(c))
+            {
+                w += cyrFM.charWidth(c);
+            }
+            else if (isDigitChar(c))
+            {
+                w += rsFM.charWidth(c);
+            }
+            else
+            {
+                // default to runescape font for latin/other letters
+                w += rsFM.charWidth(c);
+            }
         }
         return w;
     }
@@ -549,10 +570,27 @@ public class ChatOverlay extends Overlay
                 || b == Character.UnicodeBlock.CYRILLIC_SUPPLEMENTARY;
     }
 
-    private static boolean isDigitOrPunct(char c)
+    /**
+     * Return true for punctuation characters (so we render them using the custom/ Cyrillic font).
+     * Uses Character.getType to cover all Unicode punctuation categories.
+     */
+    private static boolean isPunctuation(char c)
     {
-        if (Character.isDigit(c)) return true;
-        return "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".indexOf(c) >= 0;
+        int t = Character.getType(c);
+        return t == Character.CONNECTOR_PUNCTUATION
+                || t == Character.DASH_PUNCTUATION
+                || t == Character.START_PUNCTUATION
+                || t == Character.END_PUNCTUATION
+                || t == Character.INITIAL_QUOTE_PUNCTUATION
+                || t == Character.FINAL_QUOTE_PUNCTUATION
+                || t == Character.OTHER_PUNCTUATION;
+    }
+    /**
+     * Keep digits detection separate (digits will still be drawn with rsFont).
+     */
+    private static boolean isDigitChar(char c)
+    {
+        return Character.isDigit(c);
     }
 
     private void drawMixed(Graphics2D g, String text, int x, int y,
@@ -562,13 +600,13 @@ public class ChatOverlay extends Overlay
 
         for (char c : text.toCharArray())
         {
-            if (isCyrillic(c))
+            if (isCyrillic(c) || isPunctuation(c))
             {
                 g.setFont(cyrFont);
                 g.drawString(String.valueOf(c), x, y);
                 x += cyrFM.charWidth(c);
             }
-            else if (isDigitOrPunct(c))
+            else if (isDigitChar(c))
             {
                 g.setFont(rsFont);
                 g.drawString(String.valueOf(c), x, y);
@@ -576,10 +614,40 @@ public class ChatOverlay extends Overlay
             }
             else
             {
+                // default: latin/other -> runescape font
                 g.setFont(rsFont);
                 g.drawString(String.valueOf(c), x, y);
                 x += rsFM.charWidth(c);
             }
         }
+    }
+
+    private Font getCustomBaseFontOrFallback(int targetSize)
+    {
+        if (customBaseFont != null) return customBaseFont;
+
+        // Try load bundled font
+        try (InputStream is = ChatOverlay.class.getResourceAsStream(CUSTOM_FONT_RESOURCE))
+        {
+            if (is != null)
+            {
+                Font raw = Font.createFont(Font.TRUETYPE_FONT, is);
+                customBaseFont = raw.deriveFont(Font.PLAIN, (float) targetSize);
+                if (DEBUG) log.info("Loaded custom font from resource: {}", CUSTOM_FONT_RESOURCE);
+                return customBaseFont;
+            }
+            else
+            {
+                if (DEBUG) log.warn("Custom font resource not found: {}", CUSTOM_FONT_RESOURCE);
+            }
+        }
+        catch (Exception e)
+        {
+            if (DEBUG) log.warn("Failed to load custom font '{}': {}", CUSTOM_FONT_RESOURCE, e.toString());
+        }
+
+        // Fallback
+        customBaseFont = new Font("Arial", Font.PLAIN, targetSize);
+        return customBaseFont;
     }
 }
