@@ -67,6 +67,8 @@ public class DeepLTranslator
                 .add("auth_key", apiKey)
                 .add("text", text)
                 .add("target_lang", targetLang)
+                .add("source_lang", "EN") // force source language for short/menu texts
+                // .add("preserve_formatting", "1") // optional: reduce reflow of punctuation/line-breaks
                 .build();
 
         // Build the HTTP request
