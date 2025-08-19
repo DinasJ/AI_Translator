@@ -1,6 +1,9 @@
 package com.example;
 
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
+import javax.inject.Singleton;
 import net.runelite.api.Client;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
@@ -9,26 +12,26 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.RuneLite;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import java.awt.*;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
-import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import net.runelite.client.RuneLite;
-
+/**
+ * AITranslatorPlugin wiring: overlays, cache, scheduler, and local glossary loading.
+ */
 @PluginDescriptor(
         name = "AI Translator",
         description = "Translates chat/dialogue text using DeepL and overlays it on screen",
@@ -37,7 +40,7 @@ import net.runelite.client.RuneLite;
 public class AITranslatorPlugin extends Plugin
 {
     private static final Logger log = LoggerFactory.getLogger(AITranslatorPlugin.class);
-    private static final boolean DEBUG = false;
+    private static final boolean DEBUG = true;
 
     @Inject private Client client;
     @Inject private ClientThread clientThread;
@@ -48,6 +51,10 @@ public class AITranslatorPlugin extends Plugin
     @Inject private DeepLTranslator translator;
     @Inject private ContextMenuOverlay contextMenuOverlay;
     @Inject private net.runelite.client.eventbus.EventBus eventBus;
+
+    // LocalGlossary: try to have Guice inject; fallback to new LocalGlossary() at startup if null.
+    @Inject
+    private LocalGlossary localGlossary;
 
     // Cache per original text
     private static final int MAX_CACHE_ENTRIES = 10_000;
@@ -83,14 +90,66 @@ public class AITranslatorPlugin extends Plugin
         return configManager.getConfig(AITranslatorConfig.class);
     }
 
+    // Provide LocalGlossary for Guice in case automatic construction fails (simple provider)
+    @Provides
+    @Singleton
+    LocalGlossary provideLocalGlossary()
+    {
+        return new LocalGlossary();
+    }
+
     @Override
     protected void startUp()
     {
+        ch.qos.logback.classic.Logger pkg =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger("com.example");
+        pkg.setLevel(ch.qos.logback.classic.Level.DEBUG);
         overlayManager.add(chatOverlay);
         overlayManager.add(tooltipOverlay);
         overlayManager.add(contextMenuOverlay);
         eventBus.register(contextMenuOverlay);
-        log.info("AI Translator started");
+
+        log.info("AI Translator starting up...");
+
+        String apiKey = config.deeplApiKey();
+        if (apiKey == null || apiKey.isEmpty())
+        {
+            log.error("No DeepL API key configured.");
+            // we continue because local glossary / caching can still be useful
+        }
+
+        // Defensive: ensure localGlossary is non-null (in case injection didn't happen)
+        // REMOVE the fallback constructor to avoid splitting instances.
+        // if (this.localGlossary == null)
+        // {
+        //     log.debug("LocalGlossary was not injected; creating a new instance.");
+        //     this.localGlossary = new LocalGlossary();
+        // }
+
+        // Load bundled glossary from classpath: src/main/resources/glossary/osrs_glossary.tsv
+        try (InputStream in = getClass().getResourceAsStream("/glossary/osrs_glossary.tsv"))
+        {
+            if (in == null)
+            {
+                log.warn("Bundled glossary not found at /glossary/osrs_glossary.tsv");
+            }
+            else
+            {
+                try
+                {
+                    this.localGlossary.loadFromTSV(in);
+                    log.info("Loaded bundled local glossary ({} entries) [instance={}]", this.localGlossary.size(), System.identityHashCode(this.localGlossary));
+                }
+                catch (IOException ex)
+                {
+                    log.error("Failed to parse bundled glossary", ex);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            log.error("Failed to load glossary", e);
+        }
 
         // Prepare cache file path per target language
         initCacheFile();
@@ -103,6 +162,8 @@ public class AITranslatorPlugin extends Plugin
 
         // Periodic cache saver
         periodicSaveTask = scheduler.scheduleWithFixedDelay(this::saveCacheIfDirty, SAVE_PERIOD_SECONDS, SAVE_PERIOD_SECONDS, TimeUnit.SECONDS);
+
+        log.info("AI Translator started");
     }
 
     @Override
@@ -132,11 +193,7 @@ public class AITranslatorPlugin extends Plugin
         log.info("AI Translator stopped");
     }
 
-    // Wherever you add to cache (after a successful translation), mark dirty:
-    // translationCache.put(currentPlain, translated);
-    // cacheDirty = true;
-
-    // And in the options special-case too (if you cache that text), mark dirty similarly.
+    // ----------------- main tick -----------------
 
     private void tick()
     {
@@ -150,21 +207,6 @@ public class AITranslatorPlugin extends Plugin
 
             List<Widget> widgets = getRelevantWidgetsAsList(optionsVisible);
             chatOverlay.updateSourceWidgets(widgets);
-
-            if (DEBUG)
-            {
-                StringBuilder sb = new StringBuilder("Tick ").append(tickCounter).append(" widgets: ");
-                for (Widget w : widgets)
-                {
-                    if (w == null) continue;
-                    int id = w.getId();
-                    String raw = w.getText();
-                    boolean hidden = w.isHidden();
-                    sb.append(String.format("[id=%d grp=%d child=%d hidden=%s len=%d] ",
-                            id, (id >>> 16), (id & 0xFFFF), hidden, raw == null ? -1 : raw.length()));
-                }
-                log.info(sb.toString());
-            }
 
             // Current visible ids
             Set<Integer> presentIds = new HashSet<>();
@@ -260,23 +302,45 @@ public class AITranslatorPlugin extends Plugin
                 final int wid = id;
                 final String currentPlain = plain;
                 log.info("[WIDGET reappear] Translate request: '{}'", currentPlain);
-                translator.translateAsync(currentPlain, lang, translated ->
+                // Check local glossary first
+                String manual = null;
+                try
                 {
-                    String out = translated == null || translated.isEmpty() ? currentPlain : translated;
-                    translationCache.put(currentPlain, out);
+                    manual = localGlossary.lookup(currentPlain);
+                }
+                catch (Exception ex)
+                {
+                    log.debug("LocalGlossary lookup failed for '{}': {}", currentPlain, ex.toString());
+                }
+
+                if (manual != null)
+                {
+                    translationCache.put(currentPlain, manual);
                     cacheDirty = true;
-                    log.info("[WIDGET reappear] Translated: '{}' -> '{}'", currentPlain, out);
-                    clientThread.invokeLater(() ->
+                    log.info("[WIDGET reappear] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
+                    final String manualFinal = manual;
+                    clientThread.invokeLater(() -> chatOverlay.setTranslation(wid, manualFinal));
+                }
+                else
+                {
+                    translator.translateAsync(currentPlain, lang, translated ->
                     {
-                        String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                        if (!currentPlain.equals(still))
+                        String out = translated == null || translated.isEmpty() ? currentPlain : translated;
+                        translationCache.put(currentPlain, out);
+                        cacheDirty = true;
+                        log.info("[WIDGET reappear] Translated: '{}' -> '{}'", currentPlain, out);
+                        clientThread.invokeLater(() ->
                         {
-                            return;
-                        }
-                        chatOverlay.setTranslation(wid, out);
-                        lastPlainById.put(wid, currentPlain);
+                            String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
+                            if (!currentPlain.equals(still))
+                            {
+                                return;
+                            }
+                            chatOverlay.setTranslation(wid, out);
+                            lastPlainById.put(wid, currentPlain);
+                        });
                     });
-                });
+                }
             }
 
             for (Widget w : widgets)
@@ -327,22 +391,46 @@ public class AITranslatorPlugin extends Plugin
                 final int wid = id;
                 final String currentPlain = plain;
                 log.info("[WIDGET] Translate request: '{}'", currentPlain);
-                translator.translateAsync(plain, lang, translated ->
+
+                // Check LocalGlossary before sending to translator
+                String manual = null;
+                try
                 {
-                    String out = translated == null || translated.isEmpty() ? currentPlain : translated;
-                    translationCache.put(currentPlain, out);
+                    manual = localGlossary.lookup(currentPlain);
+                }
+                catch (Exception ex)
+                {
+                    // Be defensive: don't let glossary exceptions break translation flow
+                    log.debug("LocalGlossary lookup failed for '{}': {}", currentPlain, ex.toString());
+                }
+
+                if (manual != null)
+                {
+                    translationCache.put(currentPlain, manual);
                     cacheDirty = true;
-                    log.info("[WIDGET] Translated: '{}' -> '{}'", currentPlain, out);
-                    clientThread.invokeLater(() ->
+                    log.info("[WIDGET] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
+                    final String manualFinal = manual;
+                    clientThread.invokeLater(() -> chatOverlay.setTranslation(wid, manualFinal));
+                }
+                else
+                {
+                    translator.translateAsync(plain, lang, translated ->
                     {
-                        String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                        if (!currentPlain.equals(still))
+                        String out = translated == null || translated.isEmpty() ? currentPlain : translated;
+                        translationCache.put(currentPlain, out);
+                        cacheDirty = true;
+                        log.info("[WIDGET] Translated: '{}' -> '{}'", currentPlain, out);
+                        clientThread.invokeLater(() ->
                         {
-                            return;
-                        }
-                        chatOverlay.setTranslation(wid, out);
+                            String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
+                            if (!currentPlain.equals(still))
+                            {
+                                return;
+                            }
+                            chatOverlay.setTranslation(wid, out);
+                        });
                     });
-                });
+                }
             }
 
             // Update previous set for next tick
@@ -609,12 +697,6 @@ public class AITranslatorPlugin extends Plugin
         }
     }
 
-    private String safeLang(String lang)
-    {
-        if (lang == null || lang.trim().isEmpty()) return "RU";
-        return lang.trim().toUpperCase();
-    }
-
     private void loadCacheFromDisk()
     {
         if (cacheFile == null) return;
@@ -705,6 +787,12 @@ public class AITranslatorPlugin extends Plugin
         if (any) cacheDirty = true;
     }
 
+    // Utility helpers used above and elsewhere in your plugin (use your existing versions)
+    private static String safeLang(String lang)
+    {
+        if (lang == null || lang.trim().isEmpty()) return "RU";
+        return lang.trim().toUpperCase();
+    }
     // Update all places where you put items into translationCache to set cacheDirty = true
     // Example inside translateAsync callback:
     // translationCache.put(currentPlain, translated);
