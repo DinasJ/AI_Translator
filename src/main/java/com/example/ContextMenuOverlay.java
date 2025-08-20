@@ -1,714 +1,65 @@
 package com.example;
 
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
-import net.runelite.api.Point;
-import net.runelite.api.events.MenuOpened;
-import net.runelite.api.events.ClientTick;
-import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.ClientTick;
+import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.ui.overlay.OverlayPriority;
 
 import javax.inject.Inject;
 import java.awt.*;
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Pattern;
 
-/**
- * Overlay that renders translated right-click tooltip text ON TOP of the vanilla tooltip.
- *
- * Behavior changes:
- *  - Checks LocalGlossary first for manual translations (never sends those to DeepL).
- *  - Falls back to DeepL for untranslated items (rate-limited + cached).
- *  - Persistent cache stored at ~/.runelite/ai-translator/cache-<LANG>.
- */
-@Slf4j
 public class ContextMenuOverlay extends Overlay
 {
+    // Layout
+    private static final int PADDING_X = 3;
+    private static final int HEADER_HEIGHT = 17;
+    private static final int ROW_HEIGHT = 15;
+
+    // Colors and header
+    private static final Color HDR_BG       = new Color(0x00, 0x00, 0x00);   // black
+    private static final Color HDR_TEXT     = new Color(0x64, 0x5B, 0x4D);   // #645B4D
+    private static final Color ROW_BG       = new Color(0x64, 0x5B, 0x4D);   // #645B4D
+    private static final Color BORDER_COL   = new Color(0x64, 0x5B, 0x4D);   // outer 1px border color
+    private static final Color HOVER_YELLOW = new Color(255, 255, 0);
+    private static final String HDR_RU      = "Выберите Действие";
+
+    // Custom font resource (bundled)
+    private static final String CUSTOM_FONT_RESOURCE = "/fonts/Runescape-Bold12-ru.ttf";
+    private static volatile Font customRawFont;
+
     private final Client client;
-    private final DeepLTranslator translator;
-    private final AITranslatorConfig config;
     private final LocalGlossary localGlossary;
 
-    // Per-source runtime caches (in-memory)
-    private final Map<String, String> actionCache = new ConcurrentHashMap<>();
-    private final Map<String, String> targetCache = new ConcurrentHashMap<>();
-    // Use key "level" in levelCache to store translation of the single word "level"
-    private final Map<String, String> levelCache = new ConcurrentHashMap<>();
-
-    private static final Pattern LEVEL_TAIL = Pattern.compile("(?i)\\(\\s*level\\s*-\\s*\\d+\\s*\\)");
-    private static final Pattern LEVEL_DIGITS = Pattern.compile("(?i)\\(\\s*level\\s*-\\s*(\\d+)\\s*\\)");
-
-    // Persistent cache map (loaded from file). Keys are namespaced (A|, T|, L|)
-    private final Map<String, String> persistentCache = new ConcurrentHashMap<>();
-    private final Path persistentCachePath;
-
-    // Track texts currently being translated to avoid duplicate parallel requests
-    private final java.util.Set<String> inFlight = java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    // Tiny token bucket to rate-limit requests (prevents 429 bursts)
-    private static final int TOKENS_MAX = 4;      // up to ~4 requests in a burst
-    private static final long REFILL_MS = 300L;   // ~3.3 req/s steady
-    private int tokens = TOKENS_MAX;
-    private long lastRefillMs = System.currentTimeMillis();
-
-    // Last snapshot of menu entries (preserving order)
+    // Snapshot for current open menu
     private volatile MenuEntry[] lastEntries = new MenuEntry[0];
-
-    // ------------------ CUSTOM FONT ------------------
-    private static final String CUSTOM_FONT_RESOURCE = "/fonts/RuneScape-Bold12-ru.ttf";
-    private volatile Font customRawFont = null;
-    private static final boolean DEBUG_FONT = false;
-    // -------------------------------------------------
-
-    // Custom menu skin colors
-    private static final Color HDR_BG     = new Color(0x00, 0x00, 0x00);     // black
-    private static final Color HDR_TEXT   = new Color(0x64, 0x5B, 0x4D);     // #645B4D
-    private static final Color ROW_BG     = new Color(0x64, 0x5B, 0x4D);     // #645B4D
-    private static final Color BORDER_COL = new Color(0x00, 0x00, 0x00);     // black
-    private static final Color HOVER_YELLOW = new Color(255, 255, 0);
-
-    private static final int PAD_X = 6;      // horizontal padding inside box
-    private static final int PAD_Y = 2;      // compact vertical padding around rows
-    private static final int HDR_PAD = 1;    // header box inner padding (as requested)
-    private static final String HDR_RU = "Выберите действие"; // "Choose Option" in Russian
-
-    private static final float FONT_SCALE = 1f;
-
-    // Track open/close transitions
-    private boolean menuWasOpen = false;
+    private volatile List<String> preparedLines = java.util.Collections.emptyList();
+    private volatile boolean menuOpen = false;
 
     @Inject
-    public ContextMenuOverlay(Client client, DeepLTranslator translator, AITranslatorConfig config, LocalGlossary localGlossary)
+    private ContextMenuOverlay(Client client, LocalGlossary localGlossary)
     {
         this.client = client;
-        this.translator = translator;
-        this.config = config;
         this.localGlossary = localGlossary;
 
         setPosition(OverlayPosition.DYNAMIC);
-        setLayer(OverlayLayer.ALWAYS_ON_TOP);
         setPriority(OverlayPriority.HIGHEST);
-
-        // Debug: confirm we see the SAME LocalGlossary instance as the plugin
-        if (log.isDebugEnabled()) {
-            log.debug("[CM] LocalGlossary instance id={} size={}", System.identityHashCode(this.localGlossary), this.localGlossary.size());
-        }
-
-        // Prepare persistent cache path (per-language file)
-        String lang = safeLang(config.targetLang()).toUpperCase(Locale.ROOT);
-        this.persistentCachePath = Paths.get(System.getProperty("user.home"), ".runelite", "ai-translator", "cache-" + lang);
-
-        // Load persistent cache (best-effort; failures are logged)
-        try
-        {
-            loadPersistentCache();
-        }
-        catch (Exception ex)
-        {
-            log.warn("[CM] Failed to load persistent cache '{}': {}", persistentCachePath, ex.toString());
-        }
-
-        // If the persistent cache already contains a localized "level" word, populate runtime cache
-        String lvl = persistentCache.get("L|level");
-        if (lvl != null && !lvl.isEmpty()) levelCache.put("level", lvl);
-
-        // Also allow LocalGlossary to pre-populate "level" if present there
-        String manualLevel = lookupLocalFlexible("level");
-        if (manualLevel != null && !manualLevel.isEmpty())
-        {
-            levelCache.put("level", manualLevel);
-            persistentPut("L|level", manualLevel);
-        }
-    }
-
-    // Helper: get from persistent cache with fallback to raw source (handles older files)
-    private String persistentGet(String key)
-    {
-        String v = persistentCache.get(key);
-        if (v != null) return v;
-        // fallback: if key is namespaced like "A|Take", try "Take" as raw key
-        int sep = key.indexOf('|');
-        if (sep >= 0 && sep + 1 < key.length())
-        {
-            String raw = key.substring(sep + 1);
-            v = persistentCache.get(raw);
-            if (v != null) return v;
-        }
-        return null;
-    }
-
-    // Put & persist exactly under the provided namespaced key
-    private void persistentPut(String key, String value)
-    {
-        if (key == null || value == null) return;
-        persistentCache.put(key, value);
-        savePersistentCache();
-    }
-
-    // Load persistent cache — supports a JSON object file where each property is "english":"russian"
-    private synchronized void loadPersistentCache() throws IOException
-    {
-        persistentCache.clear();
-        Path p = persistentCachePath;
-        if (!Files.exists(p)) return;
-
-        String content = new String(Files.readAllBytes(p), StandardCharsets.UTF_8).trim();
-        if (content.isEmpty()) return;
-
-        if (content.startsWith("{"))
-        {
-            Pattern pair = Pattern.compile("\"((?:\\\\.|[^\"\\\\])*)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"", Pattern.DOTALL);
-            Matcher m = pair.matcher(content);
-            while (m.find())
-            {
-                String rawKey = m.group(1);
-                String rawVal = m.group(2);
-                String key = unescapeJson(rawKey);
-                String val = unescapeJson(rawVal);
-                persistentCache.put(key, val);
-            }
-        }
-        else
-        {
-            Properties props = new Properties();
-            try (Reader r = Files.newBufferedReader(p, StandardCharsets.UTF_8))
-            {
-                props.load(r);
-                for (String k : props.stringPropertyNames())
-                {
-                    persistentCache.put(k, props.getProperty(k));
-                }
-            }
-        }
-
-        log.info("[CM] Loaded persistent cache {} entries from {}", persistentCache.size(), p);
-    }
-
-    // Save persistent cache as JSON (atomic)
-    private synchronized void savePersistentCache()
-    {
-        try
-        {
-            Files.createDirectories(persistentCachePath.getParent());
-            Path tmp = persistentCachePath.resolveSibling(persistentCachePath.getFileName().toString() + ".tmp");
-
-            try (BufferedWriter w = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))
-            {
-                w.write("{");
-                boolean first = true;
-                for (Map.Entry<String, String> e : persistentCache.entrySet())
-                {
-                    if (!first) w.write(",");
-                    first = false;
-                    String k = escapeJson(e.getKey());
-                    String v = escapeJson(e.getValue());
-                    w.write("\n  \"");
-                    w.write(k);
-                    w.write("\": \"");
-                    w.write(v);
-                    w.write("\"");
-                }
-                if (!persistentCache.isEmpty()) w.write("\n");
-                w.write("}");
-                w.flush();
-            }
-
-            Files.move(tmp, persistentCachePath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        }
-        catch (Exception ex)
-        {
-            log.warn("[CM] Failed to save persistent cache to {}: {}", persistentCachePath, ex.toString());
-        }
-    }
-
-    // Minimal JSON unescape
-    private static String unescapeJson(String s)
-    {
-        if (s == null || s.indexOf('\\') < 0) return s;
-        StringBuilder sb = new StringBuilder(s.length());
-        for (int i = 0; i < s.length(); )
-        {
-            char c = s.charAt(i++);
-            if (c != '\\')
-            {
-                sb.append(c);
-                continue;
-            }
-            if (i >= s.length()) break;
-            char esc = s.charAt(i++);
-            switch (esc)
-            {
-                case 'b': sb.append('\b'); break;
-                case 'f': sb.append('\f'); break;
-                case 'n': sb.append('\n'); break;
-                case 'r': sb.append('\r'); break;
-                case 't': sb.append('\t'); break;
-                case '\"': sb.append('\"'); break;
-                case '\\': sb.append('\\'); break;
-                case '/': sb.append('/'); break;
-                case 'u':
-                    if (i + 4 <= s.length())
-                    {
-                        String hx = s.substring(i, i + 4);
-                        try
-                        {
-                            int code = Integer.parseInt(hx, 16);
-                            sb.append((char) code);
-                            i += 4;
-                        }
-                        catch (NumberFormatException ex)
-                        {
-                            sb.append("\\u");
-                        }
-                    }
-                    else
-                    {
-                        sb.append("\\u");
-                    }
-                    break;
-                default:
-                    sb.append(esc);
-                    break;
-            }
-        }
-        return sb.toString();
-    }
-
-    // Minimal JSON escape
-    private static String escapeJson(String s)
-    {
-        if (s == null) return "";
-        StringBuilder sb = new StringBuilder(s.length() + 8);
-        for (int i = 0; i < s.length(); i++)
-        {
-            char c = s.charAt(i);
-            switch (c)
-            {
-                case '\\': sb.append("\\\\"); break;
-                case '\"': sb.append("\\\""); break;
-                case '\b': sb.append("\\b"); break;
-                case '\f': sb.append("\\f"); break;
-                case '\n': sb.append("\\n"); break;
-                case '\r': sb.append("\\r"); break;
-                case '\t': sb.append("\\t"); break;
-                default:
-                    if (c < 0x20 || c > 0x7E)
-                    {
-                        sb.append(String.format("\\u%04x", (int) c));
-                    }
-                    else
-                    {
-                        sb.append(c);
-                    }
-                    break;
-            }
-        }
-        return sb.toString();
-    }
-
-    @Subscribe
-    public void onClientTick(ClientTick tick)
-    {
-        boolean open = client.isMenuOpen();
-        if (!open && menuWasOpen)
-        {
-            // Menu has just closed — clear the snapshot so we don't render stale data
-            lastEntries = new MenuEntry[0];
-            log.info("[CM] Menu closed: cleared snapshot");
-        }
-        menuWasOpen = open;
-    }
-
-    @Subscribe
-    public void onMenuOpened(MenuOpened event)
-    {
-        MenuEntry[] all = client.getMenuEntries();
-        if (all == null) all = new MenuEntry[0];
-        lastEntries = Arrays.stream(all).filter(Objects::nonNull).toArray(MenuEntry[]::new);
-        requestTranslationsFor(lastEntries);
-        menuWasOpen = true;
-        log.info("[CM] onMenuOpened: snap entries={}", lastEntries.length);
-    }
-
-    private void requestTranslationsFor(MenuEntry[] entries)
-    {
-        if (entries == null || entries.length == 0) return;
-        final String lang = safeLang(config.targetLang());
-
-        // Ensure the "level" word is available for player-target rendering
-        ensureLevelWord(lang);
-
-        for (MenuEntry e : entries)
-        {
-            if (e == null) continue;
-
-            final String actionTagged = safe(e.getOption()); // "Light"
-            final String targetTagged = safe(e.getTarget()); // "<col=ff9040>Logs</col>"
-            final MenuAction type = e.getType();
-
-            // normalized action (no tags, collapsed spacing)
-            final String actionPlain = normalizeAction(stripColTags(actionTagged));
-            final String cleanTarget = stripColTags(targetTagged);
-
-            // 1) Phrase-level check: "actionPlain + ' ' + cleanTarget"
-            if (!actionPlain.isEmpty() && !cleanTarget.isEmpty() && !isPlayerAction(type))
-            {
-                String combinedKey = actionPlain + " " + cleanTarget;
-                String combinedManual = lookupLocalFlexible(combinedKey);
-                if (combinedManual != null)
-                {
-                    log.debug("[CM] local COMBINED hit: '{}' -> '{}'", combinedKey, combinedManual);
-
-                    // We have an explicit combined phrase translation (e.g., "Light Logs" -> "Поджечь Бревна")
-                    // Try to split it into action / target translations.
-                    CombinedParts parts = splitCombinedTranslation(combinedManual, actionPlain, cleanTarget);
-                    if (parts != null)
-                    {
-                        // ACTION part
-                        if (parts.action != null && !parts.action.isEmpty())
-                        {
-                            // We have a manual action translation — use it and persist it.
-                            actionCache.put(actionPlain, parts.action);
-                            persistentPut("A|" + actionPlain, parts.action);
-                            log.info("[CM] local COMBINED -> ACTION: '{}' -> '{}'", actionPlain, parts.action);
-                        }
-                        else
-                        {
-                            // No manual action part — request async translation for the action
-                            if (!actionPlain.isEmpty())
-                            {
-                                guardedTranslate(actionPlain, lang, true);
-                                log.debug("[CM] requested async translation for action '{}' because combined provided only target", actionPlain);
-                            }
-                        }
-
-                        // TARGET part: store keyed by the original tagged string so colors are preserved
-                        if (parts.target != null)
-                        {
-                            // if empty string intentionally means "hide target", allow storing it
-                            targetCache.put(targetTagged, parts.target);
-                            persistentPut("T|" + targetTagged, parts.target);
-                            log.info("[CM] local COMBINED -> TARGET: '{}' -> '{}'", targetTagged, parts.target);
-                        }
-
-                        // we've handled this menu entry via combined gloss — move to next entry
-                        continue;
-                    }
-                    else
-                    {
-                        // fallback: store as whole-line on action side (previous behavior)
-                        actionCache.put(actionPlain, combinedManual);
-                        persistentPut("A|" + actionPlain, combinedManual);
-                        log.info("[CM] local COMBINED (no-split) hit: '{}' -> '{}'", combinedKey, combinedManual);
-                        continue;
-                    }
-                }
-            }
-
-            // ACTION: translate the normalized option as-is
-            if (!actionPlain.isEmpty())
-            {
-                String actionSrc = actionPlain;
-
-                String manualAction = null;
-
-                // 1) Prefer flexible phrase lookup first (honors exact multi-word entries like "Walk here")
-                manualAction = lookupLocalFlexible(actionSrc);
-                if (manualAction == null)
-                {
-                    // Also try the original stripped option (keeps hyphens etc.) as a phrase
-                    try
-                    {
-                        String bareOption = stripColTags(actionTagged).trim();
-                        String phrase = localGlossary.lookup(bareOption);
-                        if (phrase != null && !phrase.isEmpty())
-                        {
-                            manualAction = phrase;
-                        }
-                    }
-                    catch (Exception ignore) {}
-                }
-
-                // 2) If phrase-level didn’t match, fall back to token-wise rewrite
-                if (manualAction == null)
-                {
-                    try
-                    {
-                        String bareOption = stripColTags(actionTagged).trim();
-                        String tokenwise = localGlossary.lookupTokens(bareOption);
-                        if (tokenwise != null && !tokenwise.isEmpty())
-                        {
-                            manualAction = tokenwise;
-                        }
-                    }
-                    catch (Exception ignore) {}
-                }
-
-                if (manualAction != null)
-                {
-                    actionCache.put(actionSrc, manualAction);
-                    persistentPut("A|" + actionSrc, manualAction);
-                    log.info("[CM] ACTION glossary hit: {} -> {}", actionSrc, manualAction);
-                }
-                else
-                {
-                    // Check runtime cache first
-                    if (!actionCache.containsKey(actionSrc))
-                    {
-                        // Check persistent cache
-                        String pKey = "A|" + actionSrc;
-                        String pVal = persistentGet(pKey);
-                        if (pVal != null)
-                        {
-                            actionCache.put(actionSrc, pVal);
-                            log.info("[CM] persistent ACTION hit: {} -> {}", pKey, pVal);
-                        }
-                        else
-                        {
-                            guardedTranslate(actionSrc, lang, true);
-                        }
-                    }
-                }
-            }
-
-            boolean isPlayer = isPlayerAction(type);
-            if (isPlayer)
-            {
-                // For players: don't translate the name; ensure "level" word is available
-            }
-            else
-            {
-                // Non-player targets: translate whole (clean) target, color locally
-                if (!targetTagged.isEmpty() && !targetCache.containsKey(targetTagged))
-                {
-                    // 1) Check local glossary: try original tagged first (in case user included tags), then bare text
-                    String manualTarget = lookupLocalFlexible(targetTagged);
-                    if (manualTarget == null)
-                    {
-                        manualTarget = lookupLocalFlexible(cleanTarget);
-                    }
-
-                    if (manualTarget != null)
-                    {
-                        // manual translation found — store as plain text (no tags)
-                        targetCache.put(targetTagged, manualTarget);
-                        persistentPut("T|" + targetTagged, manualTarget);
-                        log.info("[CM] local TARGET hit: {} -> {}", targetTagged, manualTarget);
-                    }
-                    else
-                    {
-                        // Check persistent cache using original tagged string to preserve colors
-                        String pKey = "T|" + targetTagged;
-                        String pVal = persistentGet(pKey);
-                        if (pVal != null)
-                        {
-                            targetCache.put(targetTagged, pVal);
-                            log.info("[CM] persistent TARGET hit: {} -> {}", pKey, pVal);
-                        }
-                        else
-                        {
-                            translateTargetWithoutTags(targetTagged, lang);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Ensure the "level" word is translated (from persistent, local glossary or request)
-    private void ensureLevelWord(String lang)
-    {
-        if (levelCache.containsKey("level")) return;
-
-        // 1) Check persistent
-        String persisted = persistentGet("L|level");
-        if (persisted != null)
-        {
-            levelCache.put("level", persisted);
-            return;
-        }
-
-        // 2) Check local glossary (flexible)
-        String manualLevel = lookupLocalFlexible("level");
-        if (manualLevel != null)
-        {
-            levelCache.put("level", manualLevel);
-            persistentPut("L|level", manualLevel);
-            log.info("[CM] local LEVEL hit: level -> {}", manualLevel);
-            return;
-        }
-
-        // 3) enqueue translation for "level"
-        String levelKey = "L|level";
-        if (!inFlight.add(levelKey)) return;
-
-        if (!tryAcquireToken())
-        {
-            inFlight.remove(levelKey);
-            return;
-        }
-
-        translator.translateAsync("level", lang, out -> {
-            try
-            {
-                String res = (out == null || out.isEmpty()) ? "level" : out.trim();
-                levelCache.put("level", res);
-                persistentPut(levelKey, res);
-                log.info("[CM] LEVEL word translated: '{}' -> '{}'", "level", res);
-            }
-            finally
-            {
-                inFlight.remove(levelKey);
-            }
-        });
-    }
-
-    // Send target text without <col> tags to DeepL and then store PLAIN result.
-    private void translateTargetWithoutTags(String originalTagged, String lang)
-    {
-        String clean = stripColTags(originalTagged);
-        if (clean.isEmpty())
-        {
-            targetCache.put(originalTagged, clean);
-            return;
-        }
-
-        final String cacheKey = "T|" + originalTagged;
-
-        // in-memory guard
-        if (!inFlight.add(cacheKey))
-        {
-            log.info("[CM] piggyback in-flight(clean target): '{}'", clean);
-            return;
-        }
-
-        if (!tryAcquireToken())
-        {
-            log.info("[CM] rate-limited; deferring target this tick: '{}'", clean);
-            inFlight.remove(cacheKey);
-            return;
-        }
-
-        // Check local glossary one more time on the plain clean text before calling DeepL
-        String manual = lookupLocalFlexible(clean);
-        if (manual != null)
-        {
-            try
-            {
-                targetCache.put(originalTagged, manual);
-                persistentPut(cacheKey, manual);
-                log.info("[CM] local TARGET (clean) hit: {} -> {}", clean, manual);
-            }
-            finally
-            {
-                inFlight.remove(cacheKey);
-            }
-            return;
-        }
-
-        translator.translateAsync(clean, lang, out -> {
-            try
-            {
-                String plain = (out == null || out.isEmpty()) ? clean : out;
-                // store plain text in runtime cache keyed by original tagged string
-                targetCache.put(originalTagged, plain);
-                persistentPut(cacheKey, plain);
-                log.info("[CM] TARGET translated(clean->plain): '{}' -> '{}'", originalTagged, plain);
-            }
-            finally
-            {
-                inFlight.remove(cacheKey);
-            }
-        });
-    }
-
-    private void guardedTranslate(String src, String lang, boolean isAction)
-    {
-        if (src == null || src.isEmpty()) return;
-
-        String prefix = isAction ? "A|" : "T|";
-        String pKey = prefix + src;
-
-        // 1) local glossary check (flexible)
-        String manual = lookupLocalFlexible(src);
-        if (manual != null)
-        {
-            if (isAction) actionCache.put(src, manual);
-            else targetCache.put(src, manual);
-
-            persistentPut(pKey, manual);
-            log.info("[CM] local cache hit: {} -> {}", pKey, manual);
-            return;
-        }
-
-        // 2) Check persistent cache first
-        String pVal = persistentGet(pKey);
-        if (pVal != null)
-        {
-            if (isAction) actionCache.put(src, pVal);
-            else targetCache.put(src, pVal);
-            log.info("[CM] persistent cache hit: {} -> {}", pKey, pVal);
-            return;
-        }
-
-        // De-dup in-flight
-        if (!inFlight.add(src))
-        {
-            log.info("[CM] piggyback in-flight: '{}'", src);
-            return;
-        }
-
-        // Rate limit
-        if (!tryAcquireToken())
-        {
-            log.info("[CM] rate-limited; deferring translation this tick: '{}'", src);
-            inFlight.remove(src);
-            return;
-        }
-
-        log.info("[CM] {} translate request: src='{}'", (isAction ? "ACTION" : "TARGET"), src);
-        translator.translateAsync(src, lang, out -> {
-            try
-            {
-                String result = (out == null || out.isEmpty()) ? src : out;
-                result = sanitizeColTags(result); // fix broken/malformed color tags from translator
-
-                if (isAction)
-                {
-                    actionCache.put(src, result);
-                }
-                else
-                {
-                    targetCache.put(src, result);
-                }
-
-                // persist
-                persistentPut(pKey, result);
-
-                log.info("[CM] {} translated: '{}' -> '{}'", (isAction ? "ACTION" : "TARGET"), src, result);
-            }
-            finally
-            {
-                inFlight.remove(src);
-            }
-        });
+        setLayer(OverlayLayer.ALWAYS_ON_TOP);
     }
 
     @Override
     public Dimension render(Graphics2D g)
     {
-        if (!client.isMenuOpen())
+        if (!client.isMenuOpen() || preparedLines.isEmpty())
         {
             return null;
         }
@@ -720,444 +71,317 @@ public class ContextMenuOverlay extends Overlay
         final int h = client.getMenuHeight();
         if (w <= 0 || h <= 0) return null;
 
-        // --- CUSTOM FONT USAGE ---
+        // Font
         Font rlBase = FontManager.getRunescapeFont();
         float targetSize = rlBase.getSize2D();
         Font menuFont = getMenuFont(targetSize);
         g.setFont(menuFont);
         FontMetrics fm = g.getFontMetrics(menuFont);
-        // -------------------------
-
-        final int hdrH = 19;
-        final int ROW_H = 15;
-
-        final int bodyY = y + hdrH;
-        final int bodyH = Math.max(0, h - hdrH);
-
+        // Metrics
         final int ascent = fm.getAscent();
         final int descent = fm.getDescent();
         final int textHeight = ascent + descent;
-        final int rowTopPadding = Math.max(0, (ROW_H - textHeight) / 2);
+        final int rowTopPadding = Math.max(0, (ROW_HEIGHT - textHeight) / 2);
 
+        // Measure max width
         int maxTextWidth = 0;
-        for (int line = 0; line < lastEntries.length; line++)
+        for (String lineText : preparedLines)
         {
-            int idx = lastEntries.length - 1 - line;
-            MenuEntry e = lastEntries[idx];
-            if (e == null) continue;
-
-            String option = safe(e.getOption()).trim();
-            String optionPlain = normalizeAction(option);
-            String actionSrc = optionPlain;
-            String actionTranslated = actionSrc.isEmpty() ? "" : actionCache.getOrDefault(actionSrc, actionSrc);
-
-            String targetTagged = safe(e.getTarget()).trim();
-            MenuAction type = e.getType();
-            boolean looksLikePlayer = isPlayerAction(type) || containsLevelTail(targetTagged);
-
-            String targetDisplay = "";
-            if (looksLikePlayer)
+            List<TextRun> runs = parseTaggedRuns(lineText, Color.WHITE);
+            int textW = 0;
+            for (TextRun run : runs)
             {
-                java.util.List<Run> runs = parseTaggedRuns(targetTagged, Color.WHITE);
-                StringBuilder sb = new StringBuilder();
-                for (Run r : runs)
-                {
-                    if (r == null || r.text == null) continue;
-                    String drawText = r.text;
-                    Matcher m = LEVEL_DIGITS.matcher(r.text);
-                    if (m.find())
-                    {
-                        String digits = m.group(1);
-                        String lvlWord = levelCache.getOrDefault("level", "level");
-                        drawText = "(" + lvlWord + "-" + digits + ")";
-                    }
-                    sb.append(drawText);
-                }
-                targetDisplay = sb.toString();
+                textW += fm.stringWidth(run.text);
             }
-            else
-            {
-                targetDisplay = targetCache.getOrDefault(targetTagged, stripColTags(targetTagged));
-                if (targetDisplay == null) targetDisplay = "";
-            }
-
-            String full = composeLine(actionTranslated, targetDisplay);
-            int textW = fm.stringWidth(full);
             if (textW > maxTextWidth) maxTextWidth = textW;
         }
 
-        int neededW = PAD_X * 2 + maxTextWidth;
+        int neededW = PADDING_X * 2 + maxTextWidth;
         final int effectiveW = Math.max(w, neededW);
 
-        Shape menuClipOld = g.getClip();
+        java.awt.Shape menuClipOld = g.getClip();
         g.setClip(new Rectangle(x, y, effectiveW, h));
 
+        // Header (black, no header-specific border)
         g.setColor(HDR_BG);
-        g.fillRect(x, y, effectiveW, hdrH);
+        g.fillRect(x, y, effectiveW, HEADER_HEIGHT);
         g.setColor(HDR_TEXT);
-        int hdrTextY = y + ((hdrH - textHeight) / 2) + ascent;
-        int hdrTextX = x + PAD_X;
+        int hdrTextY = y + ((HEADER_HEIGHT - textHeight) / 2) + ascent - 2; // nudge up by 2px
+        int hdrTextX = x + PADDING_X;
         g.drawString(HDR_RU, hdrTextX, hdrTextY);
 
+        // Body background
+        final int bodyY = y + HEADER_HEIGHT;
+        final int bodyH = Math.max(0, h - HEADER_HEIGHT);
         g.setColor(ROW_BG);
         g.fillRect(x, bodyY, effectiveW, bodyH);
+
+        // Outer 1px border around the whole rectangle (#645B4D)
         g.setColor(BORDER_COL);
         g.drawRect(x, y, effectiveW - 1, h - 1);
 
-        Point mp = client.getMouseCanvasPosition();
+        // Inner 1px border for the options area (inside the body rect). No borders between lines.
+        g.setColor(Color.BLACK);
+        if (bodyH > 2 && effectiveW > 2)
+        {
+            g.drawRect(x + 1, bodyY + 1, effectiveW - 3, bodyH - 3);
+        }
+
+        // Hovered row index
+        net.runelite.api.Point mp = client.getMouseCanvasPosition();
         int hoveredIndex = -1;
         if (mp != null)
         {
-            int relY = mp.getY() - y - hdrH;
+            int relY = mp.getY() - y - HEADER_HEIGHT;
             if (relY >= 0) {
-                hoveredIndex = relY / ROW_H;
-                if (hoveredIndex < 0 || hoveredIndex >= lastEntries.length) hoveredIndex = -1;
+                hoveredIndex = relY / ROW_HEIGHT;
+                if (hoveredIndex < 0 || hoveredIndex >= preparedLines.size()) hoveredIndex = -1;
             }
         }
 
-        int baseY = y + hdrH + rowTopPadding + ascent;
+        // Baseline for first rendered row (bottom-most entry is index 0 in our prepared list)
+        int baseY = y + HEADER_HEIGHT + rowTopPadding + ascent;
 
-        for (int line = 0; line < lastEntries.length; line++)
+        // Draw rows (preparedLines is ordered bottom-up)
+        for (int line = 0; line < preparedLines.size(); line++)
         {
-            int idx = lastEntries.length - 1 - line;
-            MenuEntry e = lastEntries[idx];
-            if (e == null) continue;
-
-            int lineY = baseY + line * ROW_H;
-            int cxLine = x + PAD_X;
-
-            String option = safe(e.getOption()).trim();
-            String optionPlain = normalizeAction(option);
-            String actionSrc = optionPlain;
-            String actionTranslated = actionSrc.isEmpty() ? "" : actionCache.getOrDefault(actionSrc, actionSrc);
-
-            String targetTagged = safe(e.getTarget()).trim();
-            MenuAction type = e.getType();
-            boolean looksLikePlayer = isPlayerAction(type) || containsLevelTail(targetTagged);
-
-            java.util.List<Seg> segs = new java.util.ArrayList<>(4);
-
-            if (!actionTranslated.isEmpty())
-            {
-                segs.add(new Seg(actionTranslated, Color.WHITE));
-                char right = 0;
-                if (looksLikePlayer)
-                {
-                    java.util.List<Run> preview = parseTaggedRuns(targetTagged, Color.WHITE);
-                    right = firstNonEmptyChar(preview);
-                }
-                else
-                {
-                    String pl = stripColTags(targetTagged);
-                    if (pl != null && !pl.isEmpty()) right = pl.charAt(0);
-                }
-                char left = actionTranslated.isEmpty() ? 0 : actionTranslated.charAt(actionTranslated.length() - 1);
-                if (right != 0 && needsSpaceBetween(left, right)) segs.add(new Seg(" ", Color.WHITE));
-            }
-
-            if (looksLikePlayer)
-            {
-                java.util.List<Run> runs = parseTaggedRuns(targetTagged, Color.WHITE);
-                for (Run r : runs)
-                {
-                    if (r.text == null || r.text.isEmpty()) continue;
-                    String drawText = r.text;
-                    Matcher m = LEVEL_DIGITS.matcher(r.text);
-                    if (m.find())
-                    {
-                        String digits = m.group(1);
-                        String lvlWord = levelCache.getOrDefault("level", "level");
-                        drawText = "(" + lvlWord + "-" + digits + ")";
-                    }
-                    segs.add(new Seg(drawText, (r.color != null ? r.color : Color.WHITE)));
-                }
-            }
-            else
-            {
-                String targetPlain = targetCache.getOrDefault(targetTagged, stripColTags(targetTagged));
-                if (targetPlain != null && !targetPlain.isEmpty())
-                {
-                    Color firstColor = firstColorFromTagged(targetTagged, Color.WHITE);
-                    segs.add(new Seg(targetPlain, firstColor));
-                }
-            }
+            String full = preparedLines.get(line);
+            int lineY = baseY + line * ROW_HEIGHT;
+            int cxLine = x + PADDING_X;
 
             boolean hovered = (line == hoveredIndex);
-            for (Seg s : segs)
+
+            // Foreground (hover highlight for default white)
+            Color base = hovered ? HOVER_YELLOW : Color.WHITE;
+            List<TextRun> runs = parseTaggedRuns(full, base);
+
+            // --- Shadow pass (draw entire line once) ---
+            StringBuilder shadowLine = new StringBuilder();
+            for (TextRun run : runs)
             {
-                if (s.text == null || s.text.isEmpty()) continue;
-
+                shadowLine.append(run.text);
+            }
+            if (shadowLine.length() > 0)
+            {
                 g.setColor(Color.BLACK);
-                g.drawString(s.text, cxLine + 1, lineY + 1);
+                g.drawString(shadowLine.toString(), cxLine + 1, lineY + 1);
+            }
 
-                Color col = s.color;
-                boolean isDefaultWhite = (col == null) || (col.getRGB() == Color.WHITE.getRGB());
-                if (hovered && isDefaultWhite) col = HOVER_YELLOW;
-
-                g.setColor(col != null ? col : Color.WHITE);
-                g.drawString(s.text, cxLine, lineY);
-                cxLine += fm.stringWidth(s.text);
+            // --- Foreground pass (colored segments) ---
+            int cx = cxLine;
+            for (TextRun run : runs)
+            {
+                g.setColor(run.color);
+                g.drawString(run.text, cx, lineY);
+                cx += fm.stringWidth(run.text);
             }
         }
-
         g.setClip(menuClipOld);
 
-        return new Dimension(w, h);
+        return new Dimension(effectiveW, h);
     }
 
-    // Loads the custom font resource once (raw), returns a derived Font of requested size.
+    // Load bundled RU font; fallback to RuneScape font
     private Font getMenuFont(float targetSize)
     {
-        if (customRawFont == null)
+        try
         {
-            synchronized (this)
+            if (customRawFont == null)
             {
-                if (customRawFont == null)
+                synchronized (ContextMenuOverlay.class)
                 {
-                    try (InputStream is = ContextMenuOverlay.class.getResourceAsStream(CUSTOM_FONT_RESOURCE))
+                    if (customRawFont == null)
                     {
-                        if (is != null)
+                        try (InputStream is = ContextMenuOverlay.class.getResourceAsStream(CUSTOM_FONT_RESOURCE))
                         {
-                            Font raw = Font.createFont(Font.TRUETYPE_FONT, is);
-                            customRawFont = raw;
-                            if (DEBUG_FONT) log.info("[CM] Loaded custom font resource: {}", CUSTOM_FONT_RESOURCE);
+                            if (is != null)
+                            {
+                                Font raw = Font.createFont(Font.TRUETYPE_FONT, is);
+                                customRawFont = raw;
+                            }
                         }
-                        else
+                        catch (Exception ignored)
                         {
-                            if (DEBUG_FONT) log.warn("[CM] Custom font resource not found: {}", CUSTOM_FONT_RESOURCE);
+                            customRawFont = null;
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        if (DEBUG_FONT) log.warn("[CM] Failed to load custom font '{}': {}", CUSTOM_FONT_RESOURCE, ex.toString());
-                        customRawFont = null;
                     }
                 }
             }
-        }
-
-        if (customRawFont != null)
-        {
-            try
+            if (customRawFont != null)
             {
                 return customRawFont.deriveFont(Font.BOLD, targetSize);
             }
-            catch (Exception ex)
-            {
-                if (DEBUG_FONT) log.warn("[CM] Failed to derive custom font size {}, falling back: {}", targetSize, ex.toString());
-            }
-        }
-
-        return FontManager.getRunescapeFont().deriveFont(Font.BOLD, targetSize);
-    }
-
-    private static class Seg { final String text; final Color color; Seg(String t, Color c) { this.text = t; this.color = c; } }
-
-    private static class Run { final String text; final Color color; Run(String text, Color color) { this.text = text; this.color = color; } }
-
-    private static java.util.List<Run> parseTaggedRuns(String input, Color defaultColor)
-    {
-        java.util.List<Run> runs = new ArrayList<>();
-        if (input == null || input.isEmpty()) return runs;
-
-        Color cur = defaultColor != null ? defaultColor : Color.WHITE;
-        String s = input;
-        int idx = 0;
-        StringBuilder buf = new StringBuilder();
-
-        while (idx < s.length())
-        {
-            int open = s.indexOf('<', idx);
-            if (open < 0) { buf.append(s, idx, s.length()); break; }
-            if (open > idx) buf.append(s, idx, open);
-            int close = s.indexOf('>', open + 1);
-            if (close < 0) { buf.append(s.substring(open)); break; }
-
-            String tagRaw = s.substring(open + 1, close);
-            String low = tagRaw.trim().toLowerCase(Locale.ROOT);
-
-            if (buf.length() > 0)
-            {
-                runs.add(new Run(buf.toString(), cur));
-                buf.setLength(0);
-            }
-
-            if (low.startsWith("col"))
-            {
-                int eq = low.indexOf('=');
-                if (eq < 0)
-                {
-                    cur = defaultColor != null ? defaultColor : Color.WHITE;
-                }
-                else
-                {
-                    String val = tagRaw.substring(eq + 1).trim();
-                    if ((val.startsWith("\"") && val.endsWith("\"")) || (val.startsWith("'") && val.endsWith("'")))
-                    {
-                        val = val.substring(1, val.length() - 1).trim();
-                    }
-                    if (val.startsWith("0x") || val.startsWith("0X")) val = val.substring(2);
-                    if (val.startsWith("#")) val = val.substring(1);
-                    val = val.replaceAll("[^0-9a-fA-F]", "");
-                    Color parsed = parseHexColor(val, cur);
-                    cur = parsed != null ? parsed : (defaultColor != null ? defaultColor : Color.WHITE);
-                }
-            }
-            else if (low.equals("/col") || low.equalsIgnoreCase("/col"))
-            {
-                cur = defaultColor != null ? defaultColor : Color.WHITE;
-            }
-
-            idx = close + 1;
-        }
-
-        if (buf.length() > 0) runs.add(new Run(buf.toString(), cur));
-
-        java.util.List<Run> merged = new ArrayList<>();
-        for (Run r : runs)
-        {
-            if (!merged.isEmpty() && colorsEqual(merged.get(merged.size() - 1).color, r.color))
-            {
-                Run last = merged.remove(merged.size() - 1);
-                merged.add(new Run(last.text + r.text, r.color));
-            }
-            else
-            {
-                merged.add(r);
-            }
-        }
-        return merged;
-    }
-
-    private static Color parseHexColor(String hex, Color fallback)
-    {
-        if (hex == null) return fallback;
-        String h = hex.trim();
-        if (h.isEmpty()) return fallback;
-
-        h = h.toLowerCase(Locale.ROOT).replaceAll("[^0-9a-f]", "");
-        if (h.isEmpty()) return fallback;
-
-        try
-        {
-            if (h.length() >= 8) h = h.substring(h.length() - 6);
-            else if (h.length() == 3) h = "" + h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
-            else if (h.length() == 4) h = String.format("%6s", h).replace(' ', '0');
-            else if (h.length() == 2)
-            {
-                int v = Integer.parseInt(h, 16) & 0xFF;
-                return new Color(v, v, v);
-            }
-            else h = String.format("%6s", h).replace(' ', '0');
-
-            int val = Integer.parseInt(h.substring(0, 6), 16);
-            return new Color((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF);
+            return FontManager.getRunescapeFont().deriveFont(Font.BOLD, targetSize);
         }
         catch (Exception ignored)
         {
-            return fallback != null ? fallback : Color.WHITE;
+            return FontManager.getRunescapeFont();
         }
     }
 
-    private static boolean isPlayerAction(MenuAction type)
+    // Build the lines once on menu open, avoiding repeated LocalGlossary lookups every frame.
+    private List<String> prepareLinesFrom(MenuEntry[] entries)
     {
-        if (type == null) return false;
-        String name = type.name();
-        if ("RUNELITE_PLAYER".equals(name)) return true;
-        if (name.startsWith("PLAYER_") && name.endsWith("_OPTION")) return true;
-        return false;
-    }
+        List<String> out = new ArrayList<>();
+        if (entries == null || entries.length == 0) return out;
 
-    private synchronized boolean tryAcquireToken()
-    {
-        long now = System.currentTimeMillis();
-        long elapsed = now - lastRefillMs;
-        if (elapsed >= REFILL_MS)
+        for (int line = 0; line < entries.length; line++)
         {
-            long add = elapsed / REFILL_MS;
-            if (add > 0)
+            int idx = entries.length - 1 - line; // bottom-up like vanilla
+            MenuEntry e = entries[idx];
+            if (e == null) continue;
+
+            String rawOption = safe(e.getOption()).trim();
+            String rawTarget = safe(e.getTarget()); // keep <col> tags
+
+            // Parse action from rawOption using color logic:
+            // default = action, <col=ffffff> = action, any other color = target
+            List<TextRun> optionRuns = parseTaggedRuns(rawOption, Color.WHITE);
+            StringBuilder actionBuf = new StringBuilder();
+            for (TextRun run : optionRuns)
             {
-                tokens = (int)Math.min(TOKENS_MAX, tokens + add);
-                lastRefillMs = now - (elapsed % REFILL_MS);
+                if (run.color.equals(Color.WHITE)) {
+                    actionBuf.append(run.text);
+                } else {
+                    // colored => treat as target instead of action
+                    rawTarget = run.text + (rawTarget.isEmpty() ? "" : " " + rawTarget);
+                }
             }
+            String actionRaw = actionBuf.toString().trim();
+
+            // Translate action strictly via glossary
+            String actionTranslated = lookupStrictAction(actionRaw);
+            if (actionTranslated == null) {
+                actionTranslated = actionRaw;
+            }
+
+            // Recompose line (this preserves col-tags on target)
+            String translatedLine = composeLine(actionTranslated, rawTarget);
+
+            out.add(translatedLine);
         }
-        if (tokens > 0)
-        {
-            tokens--;
-            return true;
-        }
-        return false;
+        return out;
     }
+
+
+    // New strict glossary lookup
+    private String lookupStrictAction(String src)
+    {
+        if (src == null || src.isEmpty()) return null;
+
+        // 1. Exact, case-sensitive
+        try {
+            String v = localGlossary.lookup(src, LocalGlossary.GlossaryType.ACTION);
+            if (v != null) return v;
+        } catch (Exception ignore) {}
+
+        // 2. Normalized
+        String norm = normalizeAction(src);
+        if (!norm.equals(src))
+        {
+            try {
+                String v = localGlossary.lookup(norm, LocalGlossary.GlossaryType.ACTION);
+                if (v != null) return v;
+            } catch (Exception ignore) {}
+        }
+
+        return null;
+    }
+
+    @Subscribe
+    public void onMenuOpened(MenuOpened ev)
+    {
+        MenuEntry[] snap = client.getMenuEntries();
+        if (snap == null) snap = new MenuEntry[0];
+        lastEntries = snap;
+        preparedLines = prepareLinesFrom(snap);
+        menuOpen = true;
+    }
+
+    @Subscribe
+    public void onClientTick(ClientTick tick)
+    {
+        // When menu closes, clear snapshot to avoid repeated prep/lookups
+        if (menuOpen && !client.isMenuOpen())
+        {
+            lastEntries = new MenuEntry[0];
+            preparedLines = java.util.Collections.emptyList();
+            menuOpen = false;
+        }
+    }
+
+    // ----------------- helpers -----------------
+
+    private static final Pattern COL_OPEN_OR_CLOSE = Pattern.compile("(?i)<col=([0-9a-f]{6})>|</col>");
 
     private static String stripColTags(String s)
     {
         if (s == null || s.isEmpty()) return "";
-        String noTags = s.replaceAll("(?i)</\\s*col\\s*>", "");
-        noTags = noTags.replaceAll("(?i)<\\s*col\\s*=\\s*[^>]*>", "");
-        return noTags;
+        return COL_OPEN_OR_CLOSE.matcher(s).replaceAll("");
+    }
+    private static class TextRun
+    {
+        final String text;
+        final Color color;
+        TextRun(String text, Color color) { this.text = text; this.color = color; }
     }
 
-    private static Color firstColorFromTagged(String tagged, Color fallback)
+    private static List<TextRun> parseTaggedRuns(String input, Color defaultColor)
     {
-        if (tagged == null) return fallback != null ? fallback : Color.WHITE;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)<\\s*col\\s*=\\s*([^>]+)>").matcher(tagged);
-        if (m.find())
+        List<TextRun> runs = new ArrayList<>();
+        if (input == null || input.isEmpty()) return runs;
+
+        Color current = defaultColor;
+        StringBuilder buf = new StringBuilder();
+
+        for (int i = 0; i < input.length(); )
         {
-            String v = m.group(1);
-            String hex = v.trim();
-            if ((hex.startsWith("\"") && hex.endsWith("\"")) || (hex.startsWith("'") && hex.endsWith("'")))
-                hex = hex.substring(1, hex.length() - 1).trim();
-            if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
-            if (hex.startsWith("#")) hex = hex.substring(1);
-            hex = hex.replaceAll("[^0-9a-fA-F]", "");
-            if (hex.length() > 6) hex = hex.substring(hex.length() - 6);
-            if (hex.length() == 3) hex = "" + hex.charAt(0) + hex.charAt(0) + hex.charAt(1) + hex.charAt(1) + hex.charAt(2) + hex.charAt(2);
-            if (hex.length() == 4) hex = String.format("%6s", hex).replace(' ', '0');
-            try
+            if (input.regionMatches(true, i, "<col=", 0, 5))
             {
-                int val = Integer.parseInt(hex, 16);
-                return new Color((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF);
+                // flush buffer
+                if (buf.length() > 0)
+                {
+                    runs.add(new TextRun(buf.toString(), current));
+                    buf.setLength(0);
+                }
+
+                int end = input.indexOf(">", i);
+                if (end > i)
+                {
+                    String hex = input.substring(i + 5, end);
+                    try { current = Color.decode("#" + hex); } catch (Exception ignore) {}
+                    i = end + 1;
+                    continue;
+                }
             }
-            catch (Exception ignored) {}
+            else if (input.regionMatches(true, i, "</col>", 0, 6))
+            {
+                // flush buffer
+                if (buf.length() > 0)
+                {
+                    runs.add(new TextRun(buf.toString(), current));
+                    buf.setLength(0);
+                }
+                current = defaultColor; // reset
+                i += 6;
+                continue;
+            }
+
+            buf.append(input.charAt(i));
+            i++;
         }
-        return fallback != null ? fallback : Color.WHITE;
-    }
 
-    private static String sanitizeColTags(String s)
-    {
-        if (s == null || s.isEmpty()) return s;
-
-        String fixed = s;
-
-        fixed = fixed.replaceAll("(?i)<\\s*/\\s*col\\s*>", "</col>");
-        if (fixed.matches("(?i).*</\\s*col\\s*$")) fixed = fixed + ">";
-
-        fixed = fixed.replaceAll("(?i)(</col>)+", "</col>");
-
-        int opens = 0, closes = 0;
-        java.util.regex.Matcher mOpen = java.util.regex.Pattern.compile("(?i)<\\s*col\\s*=").matcher(fixed);
-        while (mOpen.find()) opens++;
-        java.util.regex.Matcher mClose = java.util.regex.Pattern.compile("(?i)</\\s*col\\s*>").matcher(fixed);
-        while (mClose.find()) closes++;
-
-        int missing = opens - closes;
-        if (missing > 0)
+        if (buf.length() > 0)
         {
-            StringBuilder sb = new StringBuilder(fixed);
-            for (int i = 0; i < missing; i++) sb.append("</col>");
-            fixed = sb.toString();
+            runs.add(new TextRun(buf.toString(), current));
         }
 
-        if (fixed.endsWith("<")) fixed = fixed.substring(0, fixed.length() - 1);
-
-        return fixed;
+        return runs;
     }
-
     private static String composeLine(String action, String target)
     {
         if (action == null) action = "";
         if (target == null) target = "";
-
         if (action.isEmpty()) return target;
         if (target.isEmpty()) return action;
 
@@ -1189,218 +413,48 @@ public class ContextMenuOverlay extends Overlay
 
     private static String safe(String s) { return s == null ? "" : s; }
 
-    private static String safeLang(String lang)
-    {
-        if (lang == null || lang.trim().isEmpty()) return "RU";
-        return lang.trim().toUpperCase(Locale.ROOT);
-    }
-
-    private static char firstNonEmptyChar(java.util.List<Run> runs)
-    {
-        if (runs == null) return 0;
-        for (Run r : runs)
-        {
-            if (r != null && r.text != null && !r.text.isEmpty())
-            {
-                return r.text.charAt(0);
-            }
-        }
-        return 0;
-    }
-
-    private static boolean colorsEqual(Color a, Color b)
-    {
-        if (a == b) return true;
-        if (a == null || b == null) return false;
-        return a.getRGB() == b.getRGB();
-    }
-
-    private static boolean containsLevelTail(String text)
-    {
-        return text != null && LEVEL_TAIL.matcher(text).find();
-    }
-
-    // ----------------- New helpers for combined-splitting and lookup -----------------
-
-    // Flexible glossary lookup that tolerates tags, spacing, and some normalization.
+    // Flexible glossary lookup (best-effort)
+    // Flexible glossary lookup with prefix matching
     private String lookupLocalFlexible(String src)
     {
         if (src == null) return null;
-        // Try direct (case-sensitive) then normalized/stripped forms.
-        String v = null;
-        try
-        {
-            v = localGlossary.lookup(src);
-            if (v != null)
-            {
-                log.debug("lookupLocalFlexible: direct '{}' -> '{}'", src, v);
-                return v;
-            }
-        }
-        catch (Exception ex)
-        {
-            log.debug("lookupLocalFlexible direct lookup failed: {}", ex.toString());
-        }
+        String v;
 
-        // strip tags casing preserved
+        // 1. Direct exact match
+        try { v = localGlossary.lookup(src, LocalGlossary.GlossaryType.ACTION); } catch (Exception ignore) { v = null; }
+        if (v != null) return v;
+
+        // 3. Strip <col> tags and retry
         String stripped = stripColTags(src);
         if (!stripped.equals(src))
         {
-            try
-            {
-                v = localGlossary.lookup(stripped);
-                if (v != null)
-                {
-                    log.debug("lookupLocalFlexible: stripped '{}' -> '{}'", src, v);
-                    return v;
-                }
-            }
-            catch (Exception ex)
-            {
-                log.debug("lookupLocalFlexible stripped lookup failed: {}", ex.toString());
-            }
+            try { v = localGlossary.lookup(stripped, LocalGlossary.GlossaryType.ACTION); } catch (Exception ignore) { v = null; }
+            if (v != null) return v;
         }
 
-        // normalized action form (lowercased normalized)
+        // 4. Hyphen / space variants
+        String hyphenVariant = src.replace(' ', '-');
+        if (!hyphenVariant.equals(src))
+        {
+            try { v = localGlossary.lookup(hyphenVariant, LocalGlossary.GlossaryType.ACTION); } catch (Exception ignore) { v = null; }
+            if (v != null) return v;
+        }
+
+        String spaceVariant = src.replace('-', ' ');
+        if (!spaceVariant.equals(src))
+        {
+            try { v = localGlossary.lookup(spaceVariant, LocalGlossary.GlossaryType.ACTION); } catch (Exception ignore) { v = null; }
+            if (v != null) return v;
+        }
+
+        // 5. Normalized variant
         String normalized = normalizeAction(src);
         if (!normalized.equals(src))
         {
-            try
-            {
-                v = localGlossary.lookup(normalized);
-                if (v != null)
-                {
-                    log.debug("lookupLocalFlexible: normalized '{}' -> '{}'", src, v);
-                    return v;
-                }
-            }
-            catch (Exception ex)
-            {
-                log.debug("lookupLocalFlexible normalized lookup failed: {}", ex.toString());
-            }
-        }
-
-        // Last resort: try stripped+normalized
-        String strippedNorm = normalizeAction(stripped);
-        if (!strippedNorm.equals(normalized))
-        {
-            try
-            {
-                v = localGlossary.lookup(strippedNorm);
-                if (v != null)
-                {
-                    log.debug("lookupLocalFlexible: stripped+normalized '{}' -> '{}'", src, v);
-                    return v;
-                }
-            }
-            catch (Exception ex)
-            {
-                log.debug("lookupLocalFlexible strippedNorm lookup failed: {}", ex.toString());
-            }
+            try { v = localGlossary.lookup(normalized, LocalGlossary.GlossaryType.ACTION); } catch (Exception ignore) { v = null; }
+            if (v != null) return v;
         }
 
         return null;
     }
-
-    // holder for split parts
-    private static class CombinedParts
-    {
-        final String action;
-        final String target;
-        CombinedParts(String action, String target) { this.action = action; this.target = target; }
-    }
-
-    /**
-     * Attempt to split a combined translation string into action and target parts.
-     *
-     * Heuristics:
-     * 1) If a translation for cleanTarget exists and combinedManual ends with it -> split.
-     * 2) Else if a translation for actionPlain exists and combinedManual starts with it -> split.
-     * 3) Else try splitting at the last space; if that yields both non-empty parts, use them.
-     *
-     * Always conservative: prefer leaving as whole-line if splitting is doubtful.
-     */
-    private CombinedParts splitCombinedTranslation(String combinedManual, String actionPlain, String cleanTarget)
-    {
-        if (combinedManual == null) return null;
-        String combinedTrim = combinedManual.trim();
-        if (combinedTrim.isEmpty()) return null;
-
-        // 1) target-guided split
-        String tgtManual = lookupLocalFlexible(cleanTarget);
-        if (tgtManual != null && !tgtManual.isEmpty())
-        {
-            String t = tgtManual.trim();
-            if (t.length() > 0)
-            {
-                if (combinedTrim.endsWith(t))
-                {
-                    String a = combinedTrim.substring(0, combinedTrim.length() - t.length()).trim();
-                    // If action part empty, still return null so caller can fallback to whole-line action
-                    return new CombinedParts(a.isEmpty() ? null : a, t);
-                }
-                // try case-insensitive
-                if (combinedTrim.toLowerCase(Locale.ROOT).endsWith(t.toLowerCase(Locale.ROOT)))
-                {
-                    String a = combinedTrim.substring(0, combinedTrim.length() - t.length()).trim();
-                    return new CombinedParts(a.isEmpty() ? null : a, t);
-                }
-            }
-        }
-
-        // 2) action-guided split
-        String actionManual = lookupLocalFlexible(actionPlain);
-        if (actionManual != null && !actionManual.isEmpty())
-        {
-            String aMan = actionManual.trim();
-            if (combinedTrim.startsWith(aMan))
-            {
-                String remainder = combinedTrim.substring(aMan.length()).trim();
-                return new CombinedParts(aMan, remainder.isEmpty() ? null : remainder);
-            }
-            if (combinedTrim.toLowerCase(Locale.ROOT).startsWith(aMan.toLowerCase(Locale.ROOT)))
-            {
-                String remainder = combinedTrim.substring(aMan.length()).trim();
-                return new CombinedParts(aMan, remainder.isEmpty() ? null : remainder);
-            }
-        }
-
-        // 3) fallback: split at the first space (conservative)
-        int spaceIdx = combinedTrim.indexOf(' ');
-        if (spaceIdx > 0 && spaceIdx < combinedTrim.length() - 1)
-        {
-            String a = combinedTrim.substring(0, spaceIdx).trim();
-            String t = combinedTrim.substring(spaceIdx + 1).trim();
-            if (!a.isEmpty() && !t.isEmpty())
-            {
-                return new CombinedParts(a, t);
-            }
-        }
-
-        // nothing sensible
-        return null;
-    }
-
-    // ---------- cache helpers ----------
-    private void initCacheFile()
-    {
-        try
-        {
-            String lang = safeLang(config.targetLang());
-            Path baseDir = net.runelite.client.RuneLite.RUNELITE_DIR.toPath().resolve("ai-translator");
-            Files.createDirectories(baseDir);
-        }
-        catch (Exception e)
-        {
-            log.error("Failed to prepare cache directory/file: {}", e.getMessage());
-        }
-    }
-
-    // The other helper functions (stripTags, getRelevantWidgetsAsList, collectDescendantTextWidgets, etc.)
-    // are assumed unchanged and present in your main plugin file. If you need me to paste them too, say so.
-
-    // NOTE: Keep other utility methods (stripTags, normalizeName, isNameWidget, isLocalPlayerName, seedPerLineCache, etc.)
-    // from your original file in place — I haven't duplicated them here to avoid verbosity. If you want the FULL file
-    // with every helper also reprinted (unchanged), tell me and I will paste the complete file again.
-
 }

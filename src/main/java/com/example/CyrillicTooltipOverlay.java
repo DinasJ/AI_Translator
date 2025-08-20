@@ -42,7 +42,8 @@ public class CyrillicTooltipOverlay extends Overlay
     public CyrillicTooltipOverlay()
     {
         setPosition(OverlayPosition.DYNAMIC);
-        setLayer(OverlayLayer.ABOVE_WIDGETS);
+        setLayer(OverlayLayer.ALWAYS_ON_TOP);
+        setPriority(net.runelite.client.ui.overlay.OverlayPriority.HIGHEST);
     }
 
     public void setText(String text) { this.text = text != null ? text : ""; }

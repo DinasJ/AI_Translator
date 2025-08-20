@@ -35,8 +35,13 @@ public class DeepLTranslator
 
     /**
      * Non-blocking translation call with a callback.
+     *
+     * @param text       The text to translate.
+     * @param targetLang The target language (e.g., "JA").
+     * @param type       The glossary type to check first (e.g., ACTIONS, NPC_NAMES).
+     * @param callback   Callback that receives the translated text.
      */
-    public void translateAsync(String text, String targetLang, Consumer<String> callback)
+    public void translateAsync(String text, String targetLang, LocalGlossary.GlossaryType type, Consumer<String> callback)
     {
         if (text == null || text.isEmpty())
         {
@@ -44,11 +49,11 @@ public class DeepLTranslator
             return;
         }
 
-        // ✅ Check local glossary first (EXACT ONLY to avoid ruining long chat lines)
-        String manual = localGlossary.lookupExact(text);
+        // ✅ Check local glossary first
+        String manual = localGlossary.lookup(text, type);
         if (manual != null)
         {
-            log.debug("Local glossary hit for '{}': '{}'", text, manual);
+            log.debug("Local glossary hit ({}): '{}' -> '{}'", type, text, manual);
             callback.accept(manual);
             return;
         }
@@ -103,8 +108,7 @@ public class DeepLTranslator
                     }
 
                     String json = rb.string();
-                    // ✅ Old-style JsonParser call
-                    JsonElement element = new JsonParser().parse(json);
+                    JsonElement element = JsonParser.parseString(json);
 
                     if (element == null || !element.isJsonObject())
                     {

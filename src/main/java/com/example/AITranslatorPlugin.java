@@ -116,6 +116,9 @@ public class AITranslatorPlugin extends Plugin
         eventBus.register(contextMenuOverlay);
         eventBus.register(this);
 
+        // Ensure tooltip overlay starts hidden
+        try { tooltipOverlay.setVisible(false); } catch (Throwable ignored) {}
+
         log.info("AI Translator (GE-annotate) starting up...");
 
         // Try to load optional ru_index_merged.json from resources (best-effort)
@@ -157,12 +160,26 @@ public class AITranslatorPlugin extends Plugin
         try
         {
             glossary = new GlossaryManager(localGlossary);
-            glossary.loadFromResource("/glossary/osrs_action_glossary.tsv");
+
+            // Load action glossary
+            localGlossary.loadFromTSV(
+                    getClass().getResourceAsStream("/glossary/osrs_action_glossary.tsv"),
+                    LocalGlossary.GlossaryType.ACTION
+            );
+
+            // Load NPC glossary
+            localGlossary.loadFromTSV(
+                    getClass().getResourceAsStream("/glossary/osrs_npc_glossary.tsv"),
+                    LocalGlossary.GlossaryType.NPC
+            );
+
+            // (optional: add ITEM / CHAT TSVs if you make them later)
         }
         catch (Exception e)
         {
             if (DEBUG) log.debug("Glossary load failed: {}", e.toString());
         }
+
 
         cacheManager = new CacheManager();
         cacheManager.init(config.targetLang());
@@ -175,7 +192,7 @@ public class AITranslatorPlugin extends Plugin
                 config,
                 chatOverlay,
                 translator,
-                glossary,
+                localGlossary,
                 cacheManager,
                 widgetCollector,
                 DEBUG
@@ -197,6 +214,9 @@ public class AITranslatorPlugin extends Plugin
             clientThread.invokeLater(this::restoreOriginalGeAnnotations);
         }
         catch (Exception ignored) {}
+
+        // Hide tooltip overlay immediately
+        try { tooltipOverlay.setVisible(false); } catch (Throwable ignored) {}
 
         if (periodicSaveTask != null) { periodicSaveTask.cancel(false); periodicSaveTask = null; }
         if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
@@ -514,6 +534,13 @@ public class AITranslatorPlugin extends Plugin
                 catch (Exception ignored) {}
             });
         }
+
+        // Update Cyrillic tooltip overlay from the current vanilla tooltip state
+        try
+        {
+            updateCyrillicTooltipOverlay();
+        }
+        catch (Exception ignored) {}
     }
 
     // ------------------- Utilities -------------------
@@ -521,5 +548,94 @@ public class AITranslatorPlugin extends Plugin
     private static String stripTags(String s)
     {
         return s == null ? "" : s.replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+    }
+
+    /**
+     * Reads the current vanilla tooltip text and wires it into CyrillicTooltipOverlay.
+     * - Anchors at the standard tooltip origin (320, 28).
+     * - Clamps into a boundary starting at x=320 to avoid covering left UI.
+     * - Hides when no tooltip is present or when the right-click menu is open.
+     */
+    private void updateCyrillicTooltipOverlay()
+    {
+        // Hide overlay if the context menu is open (to avoid overlap)
+        if (client.isMenuOpen())
+        {
+            if (tooltipOverlay.isVisible()) tooltipOverlay.setVisible(false);
+            return;
+        }
+
+        // Best-effort pull of the current tooltip text (may be null/empty)
+        String tip = null;
+        try
+        {
+            tip = getVanillaTooltipReflective();
+        }
+        catch (Throwable ignored)
+        {
+            // If unavailable on this client, keep overlay hidden
+            if (tooltipOverlay.isVisible()) tooltipOverlay.setVisible(false);
+            return;
+        }
+
+        if (tip == null || tip.trim().isEmpty())
+        {
+            if (tooltipOverlay.isVisible()) tooltipOverlay.setVisible(false);
+            return;
+        }
+
+        // Prepare anchor and bounds. The overlay expects:
+        // - anchor at the vanilla tooltip origin (approx 320,28).
+        // - bounds starting at x=320 spanning to the right edge of the canvas.
+        final int canvasW = client.getCanvasWidth();
+        final int canvasH = client.getCanvasHeight();
+        final int anchorX = 320;
+        final int anchorY = 28;
+
+        int boundX = 320;
+        int boundY = 0;
+        int boundW = Math.max(1, canvasW - boundX);
+        int boundH = Math.max(1, canvasH - boundY);
+
+        tooltipOverlay.updateAnchor(anchorX, anchorY);
+        tooltipOverlay.updateBounds(boundX, boundY, boundW, boundH);
+        tooltipOverlay.setText(tip);
+        tooltipOverlay.setVisible(true);
+    }
+
+    /**
+     * Attempt to read the game's current tooltip text via reflection to support multiple client API variants.
+     * Tries a small set of known method names and returns the first non-empty String.
+     */
+    private String getVanillaTooltipReflective()
+    {
+        final String[] candidates = {
+                "getTooltipText",
+                "getTooltip",
+                "getMouseTooltip",
+                "getMouseOverText",
+                "getMouseoverText"
+        };
+        for (String name : candidates)
+        {
+            try
+            {
+                java.lang.reflect.Method m = client.getClass().getMethod(name);
+                if (m.getReturnType() == String.class)
+                {
+                    Object val = m.invoke(client);
+                    if (val instanceof String)
+                    {
+                        String s = (String) val;
+                        if (s != null && !s.trim().isEmpty())
+                        {
+                            return s;
+                        }
+                    }
+                }
+            }
+            catch (Throwable ignored) { }
+        }
+        return null;
     }
 }
