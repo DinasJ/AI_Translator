@@ -1,46 +1,58 @@
 package com.example;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
-import javax.inject.Singleton;
-import net.runelite.api.Client;
-import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetInfo;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.RuneLite;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
-import java.awt.*;
+import javax.inject.Singleton;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.util.*;
-import java.util.List;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import net.runelite.api.Client;
+import net.runelite.api.events.ClientTick;
+import net.runelite.api.events.ScriptCallbackEvent;
+import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.events.WidgetClosed;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
- * AITranslatorPlugin wiring: overlays, cache, scheduler, and local glossary loading.
+ * AITranslatorPlugin — patched final for GE widget mutation test.
+ * - Annotates GE results by appending a small gray Russian name if available in ruIndex.
+ * - Safe: all widget reads/writes happen on the client thread and the annotation is throttled.
+ * - Restores original texts on shutdown.
+ * Notes:
+ *  - This is an exploratory convenience tool. The game/client may overwrite widget text
+ *    at any time; we re-apply annotations on GE script callbacks and when the GE widgets load.
+ *  - If you want to try setting widget itemId or injecting menu entries, that can be added later.
  */
 @PluginDescriptor(
-        name = "AI Translator",
-        description = "Translates chat/dialogue text using DeepL and overlays it on screen",
+        name = "AI Translator (GE-annotate test)",
+        description = "Annotates Grand Exchange results with Russian names (experimental)",
         enabledByDefault = false
 )
 public class AITranslatorPlugin extends Plugin
 {
     private static final Logger log = LoggerFactory.getLogger(AITranslatorPlugin.class);
     private static final boolean DEBUG = true;
+    private static final long SAVE_PERIOD_SECONDS = 30;
 
     @Inject private Client client;
     @Inject private ClientThread clientThread;
@@ -51,38 +63,31 @@ public class AITranslatorPlugin extends Plugin
     @Inject private DeepLTranslator translator;
     @Inject private ContextMenuOverlay contextMenuOverlay;
     @Inject private net.runelite.client.eventbus.EventBus eventBus;
+    @Inject private LocalGlossary localGlossary;
 
-    // LocalGlossary: try to have Guice inject; fallback to new LocalGlossary() at startup if null.
-    @Inject
-    private LocalGlossary localGlossary;
-
-    // Cache per original text
-    private static final int MAX_CACHE_ENTRIES = 10_000;
-    private static final long SAVE_PERIOD_SECONDS = 30;
-
-    private final Gson gson = new Gson();
-
-    // LRU cache (evicts oldest when exceeding MAX_CACHE_ENTRIES)
-    private final Map<String, String> translationCache =
-            java.util.Collections.synchronizedMap(new LinkedHashMap<String, String>(1024, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
-                    return size() > MAX_CACHE_ENTRIES;
-                }
-            });
-    // Track last seen plain text per widget id to only retranslate changes
-    private final Map<Integer, String> lastPlainById = new HashMap<>();
-
-    private volatile boolean cacheDirty = false;
-    private Path cacheFile = null;
-    private java.util.concurrent.ScheduledFuture<?> periodicSaveTask;
+    // Managers (may be present or null depending on your project)
+    private GlossaryManager glossary;
+    private CacheManager cacheManager;
+    private WidgetCollector widgetCollector;
+    private TranslationManager translationManager;
 
     private ScheduledExecutorService scheduler;
-    private int tickCounter = 0;
-    private static final int GRACE_TICKS = 3; // keep translations for N ticks after widget disappears
+    private java.util.concurrent.ScheduledFuture<?> periodicSaveTask;
 
-    // Track previous tick's visible ids to detect reappearing widgets
-    private Set<Integer> prevPresentIds = new HashSet<>();
+    private volatile int tickCounter = 0;
+
+    // RU index (optional): if available, used to map gameId -> Russian name
+    private RuIndexLoader.RuIndex ruIndex = null;
+
+    // Cached GE container widget (the parent that holds the results rows)
+    private volatile Widget cachedGeContainer = null;
+
+    // Original texts we changed: widgetId -> originalText (we restore on shutdown)
+    private final Map<Integer, String> geOriginalText = new HashMap<>();
+
+    // Annotation throttling / guard
+    private volatile long lastAnnotateMs = 0L;
+    private static final long ANNOTATE_THROTTLE_MS = 180L; // milliseconds
 
     @Provides
     AITranslatorConfig provideConfig(ConfigManager configManager)
@@ -90,7 +95,6 @@ public class AITranslatorPlugin extends Plugin
         return configManager.getConfig(AITranslatorConfig.class);
     }
 
-    // Provide LocalGlossary for Guice in case automatic construction fails (simple provider)
     @Provides
     @Singleton
     LocalGlossary provideLocalGlossary()
@@ -101,700 +105,421 @@ public class AITranslatorPlugin extends Plugin
     @Override
     protected void startUp()
     {
+        // Set package-level logger to debug during development
         ch.qos.logback.classic.Logger pkg =
                 (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger("com.example");
         pkg.setLevel(ch.qos.logback.classic.Level.DEBUG);
+
         overlayManager.add(chatOverlay);
         overlayManager.add(tooltipOverlay);
         overlayManager.add(contextMenuOverlay);
         eventBus.register(contextMenuOverlay);
+        eventBus.register(this);
 
-        log.info("AI Translator starting up...");
+        log.info("AI Translator (GE-annotate) starting up...");
 
-        String apiKey = config.deeplApiKey();
-        if (apiKey == null || apiKey.isEmpty())
+        // Try to load optional ru_index_merged.json from resources (best-effort)
+        try
         {
-            log.error("No DeepL API key configured.");
-            // we continue because local glossary / caching can still be useful
+            String resourcePath = "/item-indexes/ru_index_merged.json";
+            try (InputStream is = AITranslatorPlugin.class.getResourceAsStream(resourcePath))
+            {
+                if (is != null)
+                {
+                    Path tmp = Files.createTempFile("ru_index_merged-", ".json");
+                    tmp.toFile().deleteOnExit();
+                    Files.copy(is, tmp, StandardCopyOption.REPLACE_EXISTING);
+                    RuIndexLoader loader = new RuIndexLoader();
+                    try
+                    {
+                        ruIndex = loader.loadIndex(tmp);
+                        if (DEBUG) log.debug("Loaded RU index (items={})", ruIndex.itemsByIndex == null ? 0 : ruIndex.itemsByIndex.size());
+                    }
+                    catch (IOException ex)
+                    {
+                        log.warn("Failed to parse RU index resource: {}", ex.toString());
+                        ruIndex = null;
+                    }
+                }
+                else
+                {
+                    if (DEBUG) log.debug("RU index resource not found at {}", resourcePath);
+                }
+            }
+        }
+        catch (Throwable t)
+        {
+            log.warn("Could not load ru_index resource: {}", t.toString());
+            ruIndex = null;
         }
 
-        // Defensive: ensure localGlossary is non-null (in case injection didn't happen)
-        // REMOVE the fallback constructor to avoid splitting instances.
-        // if (this.localGlossary == null)
-        // {
-        //     log.debug("LocalGlossary was not injected; creating a new instance.");
-        //     this.localGlossary = new LocalGlossary();
-        // }
-
-        // Load bundled glossary from classpath: src/main/resources/glossary/osrs_glossary.tsv
-        try (InputStream in = getClass().getResourceAsStream("/glossary/osrs_glossary.tsv"))
+        // Managers + scheduler kept minimal for this test; existing components may be initialized elsewhere
+        try
         {
-            if (in == null)
-            {
-                log.warn("Bundled glossary not found at /glossary/osrs_glossary.tsv");
-            }
-            else
-            {
-                try
-                {
-                    this.localGlossary.loadFromTSV(in);
-                    log.info("Loaded bundled local glossary ({} entries) [instance={}]", this.localGlossary.size(), System.identityHashCode(this.localGlossary));
-                }
-                catch (IOException ex)
-                {
-                    log.error("Failed to parse bundled glossary", ex);
-                }
-            }
+            glossary = new GlossaryManager(localGlossary);
+            glossary.loadFromResource("/glossary/osrs_action_glossary.tsv");
         }
         catch (Exception e)
         {
-            log.error("Failed to load glossary", e);
+            if (DEBUG) log.debug("Glossary load failed: {}", e.toString());
         }
 
-        // Prepare cache file path per target language
-        initCacheFile();
+        cacheManager = new CacheManager();
+        cacheManager.init(config.targetLang());
+        cacheManager.load();
 
-        // Load cache from disk
-        loadCacheFromDisk();
+        widgetCollector = new WidgetCollector(client, DEBUG);
+        translationManager = new TranslationManager(
+                client,
+                clientThread,
+                config,
+                chatOverlay,
+                translator,
+                glossary,
+                cacheManager,
+                widgetCollector,
+                DEBUG
+        );
 
         scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(this::tick, 0, 400, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(() -> clientThread.invokeLater(translationManager::tick), 0, 700, TimeUnit.MILLISECONDS);
+        periodicSaveTask = scheduler.scheduleWithFixedDelay(cacheManager::saveIfDirty, SAVE_PERIOD_SECONDS, SAVE_PERIOD_SECONDS, TimeUnit.SECONDS);
 
-        // Periodic cache saver
-        periodicSaveTask = scheduler.scheduleWithFixedDelay(this::saveCacheIfDirty, SAVE_PERIOD_SECONDS, SAVE_PERIOD_SECONDS, TimeUnit.SECONDS);
-
-        log.info("AI Translator started");
+        log.info("AI Translator (GE-annotate) started");
     }
 
     @Override
     protected void shutDown()
     {
-        // Persist cache synchronously before shutdown
-        saveCacheNow();
+        // Restore any modified widget texts before quitting
+        try
+        {
+            clientThread.invokeLater(this::restoreOriginalGeAnnotations);
+        }
+        catch (Exception ignored) {}
 
-        if (periodicSaveTask != null)
-        {
-            periodicSaveTask.cancel(false);
-            periodicSaveTask = null;
-        }
-        if (scheduler != null)
-        {
-            scheduler.shutdown();
-            scheduler = null;
-        }
+        if (periodicSaveTask != null) { periodicSaveTask.cancel(false); periodicSaveTask = null; }
+        if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
+
         overlayManager.remove(chatOverlay);
         overlayManager.remove(tooltipOverlay);
         overlayManager.remove(contextMenuOverlay);
         eventBus.unregister(contextMenuOverlay);
-        translationCache.clear();
-        lastPlainById.clear();
-        prevPresentIds.clear();
-        clientThread.invokeLater(chatOverlay::clearAllTranslations);
-        log.info("AI Translator stopped");
+        eventBus.unregister(this);
+
+        if (translationManager != null) translationManager.clearState();
+
+        log.info("AI Translator (GE-annotate) stopped");
     }
 
-    // ----------------- main tick -----------------
+    // ------------------- GE container discovery -------------------
 
-    private void tick()
+    // Heuristic to find the GE results container: looks for text "What would you like to buy?"
+    // Must be called on client thread.
+    private Widget findGeResultsContainer()
     {
+        final String headerEng = "What would you like to buy?";
+        final String headerShort = "What would"; // short fallback
+
+        // scan a reasonable range of root groups
+        for (int group = 0; group < 300; group++)
+        {
+            Widget root = client.getWidget(group, 0);
+            if (root == null) continue;
+
+            Deque<Widget> stack = new ArrayDeque<>();
+            stack.push(root);
+
+            while (!stack.isEmpty())
+            {
+                Widget w = stack.pop();
+                if (w == null) continue;
+
+                try
+                {
+                    String text = w.getText();
+                    if (text != null && (text.contains(headerEng) || text.contains(headerShort)))
+                    {
+                        Widget parent = w.getParent();
+                        if (parent != null)
+                        {
+                            Widget grand = parent.getParent();
+                            if (grand != null) return grand;
+                            return parent;
+                        }
+                        return w;
+                    }
+                }
+                catch (Exception ignored) { }
+
+                Widget[] dyn = w.getDynamicChildren();
+                Widget[] ch  = w.getChildren();
+                Widget[] st  = w.getStaticChildren();
+                if (dyn != null) for (Widget c : dyn) if (c != null) stack.push(c);
+                if (ch  != null) for (Widget c : ch)  if (c != null) stack.push(c);
+                if (st  != null) for (Widget c : st)  if (c != null) stack.push(c);
+            }
+        }
+        return null;
+    }
+
+    // ------------------- GE annotation logic -------------------
+
+    /**
+     * Annotate GE result rows by appending " <col=aaaaaa>RU_NAME</col>" to visible text.
+     * Must be invoked on the client thread. Throttled internally.
+     */
+    private void annotateGeResults()
+    {
+        // Ensure running on client thread; if not, schedule and return
+        if (!client.isClientThread())
+        {
+            clientThread.invokeLater(this::annotateGeResults);
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - lastAnnotateMs < ANNOTATE_THROTTLE_MS)
+        {
+            return;
+        }
+        lastAnnotateMs = now;
+
+        Widget ge = findGeResultsContainer();
+        if (ge != null)
+        {
+            Widget[] rows = ge.getDynamicChildren();
+            if (rows != null && rows.length > 0)
+            {
+                rows[0].setText("<col=ff0000>ТЕ</col>");
+                rows[0].revalidate();
+                log.debug("Mutated first GE row text to ТЕСТ");
+            }
+        }
+
+        Widget[] rows = ge.getDynamicChildren();
+        if (rows == null || rows.length == 0) rows = ge.getChildren();
+        if (rows == null || rows.length == 0) rows = ge.getStaticChildren();
+        if (rows == null) return;
+
+        for (Widget row : rows)
+        {
+            try
+            {
+                if (row == null || row.isHidden()) continue;
+
+                // Determine gameId for this row (look at row or its children)
+                int itemId = row.getItemId();
+                if (itemId <= 0)
+                {
+                    Widget[] dyn = row.getDynamicChildren();
+                    if (dyn != null)
+                    {
+                        for (Widget w : dyn)
+                        {
+                            if (w == null) continue;
+                            if (w.getItemId() > 0)
+                            {
+                                itemId = w.getItemId();
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                String ruName = "";
+                if (itemId > 0 && ruIndex != null)
+                {
+                    ruName = ruIndex.getRuName(itemId);
+                }
+
+                if (ruName == null) ruName = "";
+                if (ruName.isEmpty()) continue;
+
+                String orig = row.getText();
+                if (orig == null) orig = "";
+
+                // Skip if already annotated
+                String annMarker = "<col=aaaaaa>" + ruName + "</col>";
+                if (orig.contains(annMarker)) continue;
+
+                // Save original only once
+                geOriginalText.putIfAbsent(row.getId(), orig);
+
+                String newText = orig + " " + annMarker;
+
+                // Apply if changed
+                if (!newText.equals(orig))
+                {
+                    try
+                    {
+                        row.setText(newText);
+                        row.revalidate(); // hint the client to redraw
+                        if (DEBUG) log.debug("Annotated GE row id={} itemId={} -> '{}'", row.getId(), itemId, ruName);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (DEBUG) log.debug("Failed to setText on widget {}: {}", row.getId(), ex.toString());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (DEBUG) log.debug("annotateGeResults row error: {}", ex.toString());
+            }
+        }
+    }
+
+    /**
+     * Restore original widget texts that we changed in annotateGeResults.
+     * Must be called on client thread (we wrap invocation where needed).
+     */
+    private void restoreOriginalGeAnnotations()
+    {
+        if (!client.isClientThread())
+        {
+            clientThread.invokeLater(this::restoreOriginalGeAnnotations);
+            return;
+        }
+
+        if (geOriginalText.isEmpty()) return;
+
+        // Iterate over a copy to avoid concurrent modifications
+        for (Integer wid : geOriginalText.keySet().toArray(new Integer[0]))
+        {
+            try
+            {
+                String orig = geOriginalText.get(wid);
+                int group = wid >>> 16;
+                int child = wid & 0xFFFF;
+                Widget w = client.getWidget(group, child);
+                if (w != null)
+                {
+                    try
+                    {
+                        String curr = w.getText();
+                        if (curr != null && !curr.equals(orig))
+                        {
+                            w.setText(orig);
+                            w.revalidate();
+                            if (DEBUG) log.debug("Restored widget id={} to original text", wid);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (DEBUG) log.debug("Failed to restore widget {}: {}", wid, ex.toString());
+                    }
+                }
+            }
+            catch (Exception ignored) {}
+            finally
+            {
+                geOriginalText.remove(wid);
+            }
+        }
+    }
+
+    // ------------------- Event handlers -------------------
+
+    @Subscribe
+    public void onScriptCallbackEvent(ScriptCallbackEvent ev)
+    {
+        String name = ev.getEventName();
+        if (name == null) return;
+
+        // Trigger annotation attempts on GE script updates
+        if (name.contains("GeOffers") || name.contains("geOffers") || name.contains("GeOffersSide"))
+        {
+            clientThread.invokeLater(() -> {
+                try { annotateGeResults(); } catch (Exception ignored) {}
+            });
+        }
+    }
+
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded ev)
+    {
+        // When widgets are loaded, try to cache GE container and annotate once
         clientThread.invokeLater(() ->
         {
-            tickCounter++;
-
-            // Detect options visibility first
-            Widget optionsContainer = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
-            boolean optionsVisible = optionsContainer != null && !optionsContainer.isHidden();
-
-            List<Widget> widgets = getRelevantWidgetsAsList(optionsVisible);
-            chatOverlay.updateSourceWidgets(widgets);
-
-            // Current visible ids
-            Set<Integer> presentIds = new HashSet<>();
-            for (Widget w : widgets) { presentIds.add(w.getId()); }
-
-            // Mark seen + prune expired (sticky grace)
-            chatOverlay.markSeen(presentIds, tickCounter);
-            chatOverlay.pruneExpired(tickCounter, GRACE_TICKS);
-
-            // Special-case: options container as a single block to avoid id-collision
-            if (optionsVisible && optionsContainer != null)
+            try
             {
-                String combinedPlain = collectOptionsPlain(optionsContainer);
-                int cid = optionsContainer.getId();
-
-                if (!combinedPlain.isEmpty())
+                Widget found = findGeResultsContainer();
+                if (found != null)
                 {
-                    String last = lastPlainById.get(cid);
-                    if (!combinedPlain.equals(last))
-                    {
-                        lastPlainById.put(cid, combinedPlain);
-
-                        String cached = translationCache.get(combinedPlain);
-                        if (cached != null)
-                        {
-                            // Seed per-line cache from cached combined text as well
-                            seedPerLineCache(combinedPlain, cached);
-                            chatOverlay.setTranslation(cid, cached);
-                        }
-                        else
-                        {
-                            final String lang = config.targetLang();
-                            log.info("[OPT] Translate request: '{}'", combinedPlain);
-                            translator.translateAsync(combinedPlain, lang, translated ->
-                            {
-                                String out = translated == null || translated.isEmpty() ? combinedPlain : translated;
-                                translationCache.put(combinedPlain, out);
-                                seedPerLineCache(combinedPlain, out);
-                                cacheDirty = true;
-                                log.info("[OPT] Translated: '{}' -> '{}'", combinedPlain, out);
-                                clientThread.invokeLater(() -> chatOverlay.setTranslation(cid, out));
-                            });
-                        }
-                    }
-                    else
-                    {
-                        String cached = translationCache.get(combinedPlain);
-                        if (cached != null)
-                        {
-                            seedPerLineCache(combinedPlain, cached);
-                            chatOverlay.setTranslation(cid, cached);
-                        }
-                    }
+                    cachedGeContainer = found;
+                    if (DEBUG) log.debug("Cached GE container id={}", found.getId());
+                    annotateGeResults();
                 }
             }
-
-            // Detect reappeared ids (present now, not present previously)
-            Set<Integer> appeared = new HashSet<>(presentIds);
-            appeared.removeAll(prevPresentIds);
-
-            // Re-assert translations for all newly appeared widgets (not only options)
-            for (Widget w : widgets)
-            {
-                if (w == null || w.isHidden()) continue;
-                int id = w.getId();
-                if (!appeared.contains(id)) continue;
-
-                String raw = w.getText();
-                if (raw == null) raw = "";
-                String plain = stripTags(raw).trim();
-
-                // Skip the player's own name on name widgets
-                if (isNameWidget(w) && isLocalPlayerName(plain))
-                {
-                    chatOverlay.setTranslation(id, "");
-                    continue;
-                }
-
-                if (plain.isEmpty())
-                {
-                    continue;
-                }
-
-                String cached = translationCache.get(plain);
-                if (cached != null)
-                {
-                    chatOverlay.setTranslation(id, cached);
-                    lastPlainById.put(id, plain);
-                    continue;
-                }
-
-                final String lang = config.targetLang();
-                final int wid = id;
-                final String currentPlain = plain;
-                log.info("[WIDGET reappear] Translate request: '{}'", currentPlain);
-                // Check local glossary first
-                String manual = null;
-                try
-                {
-                    manual = localGlossary.lookup(currentPlain);
-                }
-                catch (Exception ex)
-                {
-                    log.debug("LocalGlossary lookup failed for '{}': {}", currentPlain, ex.toString());
-                }
-
-                if (manual != null)
-                {
-                    translationCache.put(currentPlain, manual);
-                    cacheDirty = true;
-                    log.info("[WIDGET reappear] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
-                    final String manualFinal = manual;
-                    clientThread.invokeLater(() -> chatOverlay.setTranslation(wid, manualFinal));
-                }
-                else
-                {
-                    translator.translateAsync(currentPlain, lang, translated ->
-                    {
-                        String out = translated == null || translated.isEmpty() ? currentPlain : translated;
-                        translationCache.put(currentPlain, out);
-                        cacheDirty = true;
-                        log.info("[WIDGET reappear] Translated: '{}' -> '{}'", currentPlain, out);
-                        clientThread.invokeLater(() ->
-                        {
-                            String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                            if (!currentPlain.equals(still))
-                            {
-                                return;
-                            }
-                            chatOverlay.setTranslation(wid, out);
-                            lastPlainById.put(wid, currentPlain);
-                        });
-                    });
-                }
-            }
-
-            for (Widget w : widgets)
-            {
-                if (w == null || w.isHidden()) continue;
-
-                int id = w.getId();
-                int grp = (id >>> 16), child = (id & 0xFFFF);
-                if (grp == 219 && child == 1) continue;
-
-                String raw = w.getText();
-                if (raw == null) raw = "";
-                String plain = stripTags(raw).trim();
-
-                if (isNameWidget(w) && isLocalPlayerName(plain))
-                {
-                    lastPlainById.put(id, plain);
-                    chatOverlay.setTranslation(id, "");
-                    continue;
-                }
-
-                if (plain.isEmpty())
-                {
-                    continue;
-                }
-
-                String last = lastPlainById.get(id);
-                if (plain.equals(last))
-                {
-                    String cached = translationCache.get(plain);
-                    if (cached != null)
-                    {
-                        chatOverlay.setTranslation(id, cached);
-                    }
-                    continue;
-                }
-
-                lastPlainById.put(id, plain);
-
-                String cached = translationCache.get(plain);
-                if (cached != null)
-                {
-                    chatOverlay.setTranslation(id, cached);
-                    continue;
-                }
-
-                final String lang = config.targetLang();
-                final int wid = id;
-                final String currentPlain = plain;
-                log.info("[WIDGET] Translate request: '{}'", currentPlain);
-
-                // Check LocalGlossary before sending to translator
-                String manual = null;
-                try
-                {
-                    manual = localGlossary.lookup(currentPlain);
-                }
-                catch (Exception ex)
-                {
-                    // Be defensive: don't let glossary exceptions break translation flow
-                    log.debug("LocalGlossary lookup failed for '{}': {}", currentPlain, ex.toString());
-                }
-
-                if (manual != null)
-                {
-                    translationCache.put(currentPlain, manual);
-                    cacheDirty = true;
-                    log.info("[WIDGET] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
-                    final String manualFinal = manual;
-                    clientThread.invokeLater(() -> chatOverlay.setTranslation(wid, manualFinal));
-                }
-                else
-                {
-                    translator.translateAsync(plain, lang, translated ->
-                    {
-                        String out = translated == null || translated.isEmpty() ? currentPlain : translated;
-                        translationCache.put(currentPlain, out);
-                        cacheDirty = true;
-                        log.info("[WIDGET] Translated: '{}' -> '{}'", currentPlain, out);
-                        clientThread.invokeLater(() ->
-                        {
-                            String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                            if (!currentPlain.equals(still))
-                            {
-                                return;
-                            }
-                            chatOverlay.setTranslation(wid, out);
-                        });
-                    });
-                }
-            }
-
-            // Update previous set for next tick
-            prevPresentIds = presentIds;
+            catch (Exception ignored) {}
         });
     }
 
-    // Collect all visible option row texts into a single plain string separated by newlines, sorted by Y then X
-    private String collectOptionsPlain(Widget optionsContainer)
+    @Subscribe
+    public void onWidgetClosed(WidgetClosed ev)
     {
-        Widget[] rows = optionsContainer.getDynamicChildren();
-        if (rows == null || rows.length == 0) rows = optionsContainer.getChildren();
-        if (rows == null || rows.length == 0) rows = optionsContainer.getStaticChildren();
-
-        if (rows == null || rows.length == 0) return "";
-
-        List<Widget> ordered = new ArrayList<>(rows.length);
-        for (Widget r : rows) if (r != null && !r.isHidden()) ordered.add(r);
-        ordered.sort((a, b) -> {
-            Rectangle ra = a.getBounds(), rb = b.getBounds();
-            int ay = ra == null ? Integer.MAX_VALUE : ra.y;
-            int by = rb == null ? Integer.MAX_VALUE : rb.y;
-            if (ay != by) return Integer.compare(ay, by);
-            int ax = ra == null ? Integer.MAX_VALUE : ra.x;
-            int bx = rb == null ? Integer.MAX_VALUE : rb.x;
-            return Integer.compare(ax, bx);
-        });
-
-        StringBuilder sb = new StringBuilder();
-        int count = 0;
-        for (Widget w : ordered)
+        // If the GE container closed, clear cache & restore annotations (best-effort)
+        clientThread.invokeLater(() ->
         {
-            if (count >= 6) break;
-            String raw = w.getText();
-            String plain = stripTags(raw).trim();
-            if (plain.isEmpty()) continue;
-            if (sb.length() > 0) sb.append("\n");
-            sb.append(plain);
-            count++;
-        }
-        return sb.toString();
-    }
-
-    // Overload: when options are visible, return only the container to avoid per-row id collisions
-    private List<Widget> getRelevantWidgetsAsList(boolean optionsVisible)
-    {
-        if (optionsVisible)
-        {
-            Widget container = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
-            if (container != null && !container.isHidden())
+            try
             {
-                if (DEBUG)
+                Widget cached = cachedGeContainer;
+                if (cached != null)
                 {
-                    Rectangle b = container.getBounds();
-                    log.info("getRelevant: options container only id={} bounds={}",
-                            container.getId(), (b == null ? "null" : (b.x + "," + b.y + " " + b.width + "x" + b.height)));
+                    int closedGroupId = ev.getGroupId();
+                    int cachedGroupId = cached.getId() >>> 16; // extract group id from full widget id
+
+                    if (closedGroupId == cachedGroupId)
+                    {
+                        if (DEBUG) log.debug("Cached GE container closed -> restoring annotations");
+                        restoreOriginalGeAnnotations();
+                        cachedGeContainer = null;
+                    }
                 }
-                List<Widget> single = new ArrayList<>(1);
-                single.add(container);
-                return single;
             }
-        }
-        return getRelevantWidgetsAsList(); // fallback to generic path
+            catch (Exception ignored) {}
+        });
     }
 
-    // ---------- helpers ----------
+    @Subscribe
+    public void onClientTick(ClientTick evt)
+    {
+        // Light-weight: if we have a cached GE container, attempt periodic re-annotation (throttled)
+        Widget ge = cachedGeContainer;
+        if (ge != null && !ge.isHidden())
+        {
+            // schedule annotate on client thread (annotateGeResults will early-exit if too soon)
+            clientThread.invokeLater(() -> {
+                try { annotateGeResults(); } catch (Exception ignored) {}
+            });
+        }
+
+        // Opportunistic rescan: if cached container is null, occasionally try to find it
+        tickCounter++;
+        if (cachedGeContainer == null && (tickCounter % 40 == 0))
+        {
+            clientThread.invokeLater(() ->
+            {
+                try
+                {
+                    Widget found = findGeResultsContainer();
+                    if (found != null)
+                    {
+                        cachedGeContainer = found;
+                        if (DEBUG) log.debug("Found & cached GE container id={}", found.getId());
+                        annotateGeResults();
+                    }
+                }
+                catch (Exception ignored) {}
+            });
+        }
+    }
+
+    // ------------------- Utilities -------------------
 
     private static String stripTags(String s)
     {
-        return s == null ? "" : s.replaceAll("<[^>]*>", "").replace('\u00A0', ' ');
+        return s == null ? "" : s.replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
     }
-
-    private boolean isNameWidget(Widget w)
-    {
-        int id = w.getId();
-        int group = (id >>> 16);
-        int child = (id & 0xFFFF);
-        // ChatLeft/ChatRight name line
-        return (group == 231 || group == 217) && child == 4;
-    }
-
-    private boolean isLocalPlayerName(String plain)
-    {
-        String lp = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null;
-        if (lp == null) return false;
-        String a = normalizeName(plain);
-        String b = normalizeName(lp);
-        return !a.isEmpty() && a.equals(b);
-    }
-
-    private static String normalizeName(String s)
-    {
-        if (s == null) return "";
-        String t = s.replace('\u00A0', ' ').trim();
-        return t.toLowerCase();
-    }
-
-    private static String truncate(String s)
-    {
-        if (s == null) return "null";
-        s = s.replace("\n", "\\n");
-        return s.length() > 80 ? s.substring(0, 80) + "…" : s;
-    }
-
-    private List<Widget> getRelevantWidgetsAsList()
-    {
-        // Use insertion-ordered map to deduplicate by widget id while preserving order
-        LinkedHashMap<Integer, Widget> byId = new LinkedHashMap<>();
-
-        java.util.function.Consumer<Widget> addIfVisible = w -> {
-            if (w != null && !w.isHidden())
-            {
-                byId.put(w.getId(), w); // dedupe by id
-            }
-        };
-
-        // 1) Chatbox scan mode: if chatbox container 162:566 is visible, scan EVERYTHING under it
-        Widget chatboxContainer = client.getWidget(162, 566);
-        if (chatboxContainer != null && !chatboxContainer.isHidden())
-        {
-            List<Widget> texts = collectDescendantTextWidgets(chatboxContainer, 200); // limit to avoid runaway
-            if (!texts.isEmpty())
-            {
-                // Sort by y,x reading order and add to map
-                texts.sort((a, b) -> {
-                    Rectangle ra = a.getBounds(), rb = b.getBounds();
-                    int ay = ra == null ? Integer.MAX_VALUE : ra.y;
-                    int by = rb == null ? Integer.MAX_VALUE : rb.y;
-                    if (ay != by) return Integer.compare(ay, by);
-                    int ax = ra == null ? Integer.MAX_VALUE : ra.x;
-                    int bx = rb == null ? Integer.MAX_VALUE : rb.x;
-                    return Integer.compare(ax, bx);
-                });
-                for (Widget w : texts) byId.put(w.getId(), w);
-
-                if (DEBUG)
-                {
-                    log.info("Chatbox scan: picked {} text widgets under 162:566", texts.size());
-                    for (Widget w : texts)
-                    {
-                        Rectangle b = w.getBounds();
-                        String raw = w.getText();
-                        log.info("  cbx id={} grp={} child={} len={} bounds={}",
-                                w.getId(), (w.getId() >>> 16), (w.getId() & 0xFFFF),
-                                raw == null ? -1 : stripTags(raw).trim().length(),
-                                (b == null ? "null" : (b.x + "," + b.y + " " + b.width + "x" + b.height)));
-                    }
-                }
-                return new ArrayList<>(byId.values());
-            }
-            else if (DEBUG)
-            {
-                log.info("Chatbox scan: 162:566 visible but found no text widgets");
-            }
-        }
-
-        // 2) Dialogue options (if visible) — keep this fast-path
-        Widget dialogOptions = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
-        if (dialogOptions != null && !dialogOptions.isHidden())
-        {
-            Widget[] rows = dialogOptions.getDynamicChildren();
-            if (rows == null || rows.length == 0) rows = dialogOptions.getChildren();
-            if (rows == null || rows.length == 0) rows = dialogOptions.getStaticChildren();
-
-            if (rows != null)
-            {
-                // Keep order as on-screen by sorting on Y, then X
-                List<Widget> ordered = new ArrayList<>(rows.length);
-                for (Widget r : rows) if (r != null && !r.isHidden()) ordered.add(r);
-                ordered.sort((a, b) -> {
-                    Rectangle ra = a.getBounds(), rb = b.getBounds();
-                    int ay = ra == null ? Integer.MAX_VALUE : ra.y;
-                    int by = rb == null ? Integer.MAX_VALUE : rb.y;
-                    if (ay != by) return Integer.compare(ay, by);
-                    int ax = ra == null ? Integer.MAX_VALUE : ra.x;
-                    int bx = rb == null ? Integer.MAX_VALUE : rb.x;
-                    return Integer.compare(ax, bx);
-                });
-
-                int count = 0;
-                for (Widget opt : ordered)
-                {
-                    String t = opt.getText();
-                    if (t == null || stripTags(t).trim().isEmpty()) continue;
-                    byId.put(opt.getId(), opt);
-                    count++;
-                    if (count >= 6) break; // usually up to 6
-                }
-                if (DEBUG) log.info("Options: picked {} row widgets", count);
-            }
-            return new ArrayList<>(byId.values());
-        }
-
-        // 3) Otherwise: normal dialogue detection (left/right chat if present)
-        addIfVisible.accept(client.getWidget(231, 4));    // ChatLeft.Name
-        addIfVisible.accept(client.getWidget(231, 6));    // ChatLeft.Text
-        addIfVisible.accept(client.getWidget(231, 5));    // ChatLeft.Continue
-
-        addIfVisible.accept(client.getWidget(217, 4));    // ChatRight.Name
-        addIfVisible.accept(client.getWidget(217, 6));    // ChatRight.Text
-        addIfVisible.accept(client.getWidget(217, 5));    // ChatRight.Continue
-
-        // Fallback generic NPC/PLAYER text
-        addIfVisible.accept(client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
-        addIfVisible.accept(client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
-
-        return new ArrayList<>(byId.values());
-    }
-
-    // Collect visible, text-like widgets under a container (BFS), skipping sprites/icons.
-    // Stops after 'limit' found to avoid pathological cases.
-    private List<Widget> collectDescendantTextWidgets(Widget root, int limit)
-    {
-        List<Widget> out = new ArrayList<>();
-        ArrayDeque<Widget> q = new ArrayDeque<>();
-        q.add(root);
-
-        while (!q.isEmpty() && out.size() < limit)
-        {
-            Widget cur = q.poll();
-            if (cur == null || cur.isHidden()) continue;
-
-            // Enqueue children (all three kinds)
-            Widget[] dyn = cur.getDynamicChildren();
-            Widget[] ch  = cur.getChildren();
-            Widget[] st  = cur.getStaticChildren();
-            if (dyn != null) for (Widget w : dyn) if (w != null) q.add(w);
-            if (ch  != null) for (Widget w : ch)  if (w != null) q.add(w);
-            if (st  != null) for (Widget w : st)  if (w != null) q.add(w);
-
-            // Skip the root itself unless it has text
-            if (cur == root) continue;
-
-            // Filter by text presence and bounds (exclude icons/sprites)
-            String raw = cur.getText();
-            if (raw == null) continue;
-            String plain = stripTags(raw).trim();
-            if (plain.isEmpty()) continue;
-
-            Rectangle b = cur.getBounds();
-            if (b == null || b.width <= 0 || b.height <= 0) continue;
-
-            out.add(cur);
-        }
-        return out;
-    }
-
-    // ---------- cache helpers ----------
-
-    private void initCacheFile()
-    {
-        try
-        {
-            String lang = safeLang(config.targetLang());
-            Path baseDir = RuneLite.RUNELITE_DIR.toPath().resolve("ai-translator");
-            Files.createDirectories(baseDir);
-            cacheFile = baseDir.resolve("cache-" + lang + ".json");
-            log.info("Cache file: {}", cacheFile.toAbsolutePath());
-        }
-        catch (Exception e)
-        {
-            log.error("Failed to prepare cache directory/file: {}", e.getMessage());
-            cacheFile = null;
-        }
-    }
-
-    private void loadCacheFromDisk()
-    {
-        if (cacheFile == null) return;
-        try
-        {
-            if (!Files.exists(cacheFile))
-            {
-                log.info("No existing cache file found (cold start)");
-                return;
-            }
-            byte[] bytes = Files.readAllBytes(cacheFile);
-            String json = new String(bytes, StandardCharsets.UTF_8);
-            Type type = new TypeToken<Map<String, String>>() {}.getType();
-            Map<String, String> loaded = gson.fromJson(json, type);
-            if (loaded != null && !loaded.isEmpty())
-            {
-                // Fill LRU map
-                for (Map.Entry<String, String> e : loaded.entrySet())
-                {
-                    if (e.getKey() != null && e.getValue() != null)
-                    {
-                        translationCache.put(e.getKey(), e.getValue());
-                    }
-                }
-                log.info("Loaded {} cached translations", translationCache.size());
-            }
-            else
-            {
-                log.info("Cache file present but empty");
-            }
-            cacheDirty = false;
-        }
-        catch (Exception e)
-        {
-            log.error("Failed to load cache: {}", e.getMessage());
-        }
-    }
-
-    private void saveCacheIfDirty()
-    {
-        if (!cacheDirty) return;
-        saveCacheNow();
-    }
-
-    private void saveCacheNow()
-    {
-        if (cacheFile == null) return;
-        try
-        {
-            // Snapshot to minimize time under synchronization
-            Map<String, String> snapshot;
-            synchronized (translationCache)
-            {
-                snapshot = new LinkedHashMap<>(translationCache);
-            }
-            String json = gson.toJson(snapshot);
-            Files.write(cacheFile, json.getBytes(StandardCharsets.UTF_8),
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-            cacheDirty = false;
-            if (DEBUG) log.info("Saved {} translations to cache", snapshot.size());
-        }
-        catch (Exception e)
-        {
-            log.error("Failed to save cache: {}", e.getMessage());
-        }
-    }
-
-    // Seed per-line cache from the combined options strings (keeps click-through panels consistent)
-    private void seedPerLineCache(String combinedPlain, String combinedTranslated)
-    {
-        if (combinedPlain == null || combinedTranslated == null) return;
-        String[] src = combinedPlain.split("\\R");
-        String[] dst = combinedTranslated.split("\\R");
-        if (src.length != dst.length) return; // mismatch: avoid wrong mappings
-
-        boolean any = false;
-        for (int i = 0; i < src.length; i++)
-        {
-            String s = src[i].trim();
-            String t = dst[i].trim();
-            if (s.isEmpty() || t.isEmpty()) continue;
-            if (!t.equals(translationCache.get(s)))
-            {
-                translationCache.put(s, t);
-                any = true;
-            }
-        }
-        if (any) cacheDirty = true;
-    }
-
-    // Utility helpers used above and elsewhere in your plugin (use your existing versions)
-    private static String safeLang(String lang)
-    {
-        if (lang == null || lang.trim().isEmpty()) return "RU";
-        return lang.trim().toUpperCase();
-    }
-    // Update all places where you put items into translationCache to set cacheDirty = true
-    // Example inside translateAsync callback:
-    // translationCache.put(currentPlain, translated);
-    // cacheDirty = true;
 }

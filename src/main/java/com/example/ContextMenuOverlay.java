@@ -27,12 +27,9 @@ import java.util.regex.Pattern;
 /**
  * Overlay that renders translated right-click tooltip text ON TOP of the vanilla tooltip.
  *
- * Behavior:
- *  - Uses LocalGlossary first (supports case-sensitive & normalized lookups).
- *  - If LocalGlossary contains a combined phrase (e.g. "Light Logs" -> "Поджечь Бревна"),
- *    the plugin will attempt to split that combined translation into action and target pieces
- *    and store them separately so UI looks like: action + target (with colors preserved).
- *  - Falls back to DeepL for missing translations.
+ * Behavior changes:
+ *  - Checks LocalGlossary first for manual translations (never sends those to DeepL).
+ *  - Falls back to DeepL for untranslated items (rate-limited + cached).
  *  - Persistent cache stored at ~/.runelite/ai-translator/cache-<LANG>.
  */
 @Slf4j
@@ -69,7 +66,7 @@ public class ContextMenuOverlay extends Overlay
     private volatile MenuEntry[] lastEntries = new MenuEntry[0];
 
     // ------------------ CUSTOM FONT ------------------
-    private static final String CUSTOM_FONT_RESOURCE = "/fonts/RuneScapeBold-ru.ttf";
+    private static final String CUSTOM_FONT_RESOURCE = "/fonts/RuneScape-Bold12-ru.ttf";
     private volatile Font customRawFont = null;
     private static final boolean DEBUG_FONT = false;
     // -------------------------------------------------
@@ -344,10 +341,6 @@ public class ContextMenuOverlay extends Overlay
         log.info("[CM] onMenuOpened: snap entries={}", lastEntries.length);
     }
 
-    /**
-     * Main logic for deciding translations for each menu entry.
-     * Tries combined phrase first (explicit only), then action-only, then target-only.
-     */
     private void requestTranslationsFor(MenuEntry[] entries)
     {
         if (entries == null || entries.length == 0) return;
@@ -368,45 +361,49 @@ public class ContextMenuOverlay extends Overlay
             final String actionPlain = normalizeAction(stripColTags(actionTagged));
             final String cleanTarget = stripColTags(targetTagged);
 
-            // DEBUG: show normalized forms for tracing
-            if (log.isDebugEnabled())
-            {
-                log.debug("[CM] entry raw option='{}' target='{}' => actionPlain='{}' cleanTarget='{}'",
-                        actionTagged, targetTagged, actionPlain, cleanTarget);
-            }
-
             // 1) Phrase-level check: "actionPlain + ' ' + cleanTarget"
             if (!actionPlain.isEmpty() && !cleanTarget.isEmpty() && !isPlayerAction(type))
             {
                 String combinedKey = actionPlain + " " + cleanTarget;
-
-                // IMPORTANT: use lookupExact so we only match an explicit combined phrase entry.
-                String combinedManual = localGlossary.lookupExact(combinedKey);
-
+                String combinedManual = lookupLocalFlexible(combinedKey);
                 if (combinedManual != null)
                 {
-                    log.info("[CM] local COMBINED hit: '{}' -> '{}'", combinedKey, combinedManual);
+                    log.debug("[CM] local COMBINED hit: '{}' -> '{}'", combinedKey, combinedManual);
 
-                    // Try to split the combined translation into action / target pieces.
-                    Pair parts = splitCombinedTranslation(combinedManual, actionPlain, cleanTarget);
-
+                    // We have an explicit combined phrase translation (e.g., "Light Logs" -> "Поджечь Бревна")
+                    // Try to split it into action / target translations.
+                    CombinedParts parts = splitCombinedTranslation(combinedManual, actionPlain, cleanTarget);
                     if (parts != null)
                     {
-                        // store both parts separately where possible
+                        // ACTION part
                         if (parts.action != null && !parts.action.isEmpty())
                         {
+                            // We have a manual action translation — use it and persist it.
                             actionCache.put(actionPlain, parts.action);
                             persistentPut("A|" + actionPlain, parts.action);
                             log.info("[CM] local COMBINED -> ACTION: '{}' -> '{}'", actionPlain, parts.action);
                         }
+                        else
+                        {
+                            // No manual action part — request async translation for the action
+                            if (!actionPlain.isEmpty())
+                            {
+                                guardedTranslate(actionPlain, lang, true);
+                                log.debug("[CM] requested async translation for action '{}' because combined provided only target", actionPlain);
+                            }
+                        }
+
+                        // TARGET part: store keyed by the original tagged string so colors are preserved
                         if (parts.target != null)
                         {
-                            // store target keyed by original tagged string so rendering preserves colors
+                            // if empty string intentionally means "hide target", allow storing it
                             targetCache.put(targetTagged, parts.target);
                             persistentPut("T|" + targetTagged, parts.target);
                             log.info("[CM] local COMBINED -> TARGET: '{}' -> '{}'", targetTagged, parts.target);
                         }
-                        continue; // done for this entry
+
+                        // we've handled this menu entry via combined gloss — move to next entry
+                        continue;
                     }
                     else
                     {
@@ -424,13 +421,45 @@ public class ContextMenuOverlay extends Overlay
             {
                 String actionSrc = actionPlain;
 
-                // 1) Check local glossary first (flexible; allows substring target matches for single tokens)
-                String manualAction = lookupLocalFlexible(actionSrc);
+                String manualAction = null;
+
+                // 1) Prefer flexible phrase lookup first (honors exact multi-word entries like "Walk here")
+                manualAction = lookupLocalFlexible(actionSrc);
+                if (manualAction == null)
+                {
+                    // Also try the original stripped option (keeps hyphens etc.) as a phrase
+                    try
+                    {
+                        String bareOption = stripColTags(actionTagged).trim();
+                        String phrase = localGlossary.lookup(bareOption);
+                        if (phrase != null && !phrase.isEmpty())
+                        {
+                            manualAction = phrase;
+                        }
+                    }
+                    catch (Exception ignore) {}
+                }
+
+                // 2) If phrase-level didn’t match, fall back to token-wise rewrite
+                if (manualAction == null)
+                {
+                    try
+                    {
+                        String bareOption = stripColTags(actionTagged).trim();
+                        String tokenwise = localGlossary.lookupTokens(bareOption);
+                        if (tokenwise != null && !tokenwise.isEmpty())
+                        {
+                            manualAction = tokenwise;
+                        }
+                    }
+                    catch (Exception ignore) {}
+                }
+
                 if (manualAction != null)
                 {
                     actionCache.put(actionSrc, manualAction);
                     persistentPut("A|" + actionSrc, manualAction);
-                    log.info("[CM] local ACTION hit: {} -> {}", actionSrc, manualAction);
+                    log.info("[CM] ACTION glossary hit: {} -> {}", actionSrc, manualAction);
                 }
                 else
                 {
@@ -510,7 +539,7 @@ public class ContextMenuOverlay extends Overlay
             return;
         }
 
-        // 2) Check local glossary
+        // 2) Check local glossary (flexible)
         String manualLevel = lookupLocalFlexible("level");
         if (manualLevel != null)
         {
@@ -676,8 +705,6 @@ public class ContextMenuOverlay extends Overlay
         });
     }
 
-    // ------------------ RENDERING & UTILITIES (unchanged) ------------------
-
     @Override
     public Dimension render(Graphics2D g)
     {
@@ -695,7 +722,7 @@ public class ContextMenuOverlay extends Overlay
 
         // --- CUSTOM FONT USAGE ---
         Font rlBase = FontManager.getRunescapeFont();
-        float targetSize = rlBase.getSize2D() * FONT_SCALE;
+        float targetSize = rlBase.getSize2D();
         Font menuFont = getMenuFont(targetSize);
         g.setFont(menuFont);
         FontMetrics fm = g.getFontMetrics(menuFont);
@@ -925,6 +952,7 @@ public class ContextMenuOverlay extends Overlay
     }
 
     private static class Seg { final String text; final Color color; Seg(String t, Color c) { this.text = t; this.color = c; } }
+
     private static class Run { final String text; final Color color; Run(String text, Color color) { this.text = text; this.color = color; } }
 
     private static java.util.List<Run> parseTaggedRuns(String input, Color defaultColor)
@@ -934,32 +962,20 @@ public class ContextMenuOverlay extends Overlay
 
         Color cur = defaultColor != null ? defaultColor : Color.WHITE;
         String s = input;
-
         int idx = 0;
         StringBuilder buf = new StringBuilder();
 
         while (idx < s.length())
         {
             int open = s.indexOf('<', idx);
-            if (open < 0)
-            {
-                buf.append(s, idx, s.length());
-                break;
-            }
-
+            if (open < 0) { buf.append(s, idx, s.length()); break; }
             if (open > idx) buf.append(s, idx, open);
-
             int close = s.indexOf('>', open + 1);
-            if (close < 0)
-            {
-                buf.append(s.substring(open));
-                break;
-            }
+            if (close < 0) { buf.append(s.substring(open)); break; }
 
-            String tagRaw = s.substring(open + 1, close); // e.g., "col=ffff00" or "col='#00ffff'" or "/col"
+            String tagRaw = s.substring(open + 1, close);
             String low = tagRaw.trim().toLowerCase(Locale.ROOT);
 
-            // Flush text collected up to this tag
             if (buf.length() > 0)
             {
                 runs.add(new Run(buf.toString(), cur));
@@ -995,12 +1011,8 @@ public class ContextMenuOverlay extends Overlay
             idx = close + 1;
         }
 
-        if (buf.length() > 0)
-        {
-            runs.add(new Run(buf.toString(), cur));
-        }
+        if (buf.length() > 0) runs.add(new Run(buf.toString(), cur));
 
-        // Merge adjacent same-color runs
         java.util.List<Run> merged = new ArrayList<>();
         for (Run r : runs)
         {
@@ -1028,35 +1040,15 @@ public class ContextMenuOverlay extends Overlay
 
         try
         {
-            if (h.length() >= 8)
-            {
-                // aarrggbb – take rrggbb
-                h = h.substring(h.length() - 6);
-            }
-            else if (h.length() == 6)
-            {
-                // rrggbb as-is
-            }
-            else if (h.length() == 3)
-            {
-                // rgb -> rrggbb
-                h = "" + h.charAt(0) + h.charAt(0)
-                        + h.charAt(1) + h.charAt(1)
-                        + h.charAt(2) + h.charAt(2);
-            }
-            else if (h.length() == 4)
-            {
-                h = String.format("%6s", h).replace(' ', '0');
-            }
+            if (h.length() >= 8) h = h.substring(h.length() - 6);
+            else if (h.length() == 3) h = "" + h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+            else if (h.length() == 4) h = String.format("%6s", h).replace(' ', '0');
             else if (h.length() == 2)
             {
                 int v = Integer.parseInt(h, 16) & 0xFF;
                 return new Color(v, v, v);
             }
-            else
-            {
-                h = String.format("%6s", h).replace(' ', '0');
-            }
+            else h = String.format("%6s", h).replace(' ', '0');
 
             int val = Integer.parseInt(h.substring(0, 6), 16);
             return new Color((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF);
@@ -1097,7 +1089,6 @@ public class ContextMenuOverlay extends Overlay
         return false;
     }
 
-    // Strip only <col=...> and </col> tags; keep all other characters
     private static String stripColTags(String s)
     {
         if (s == null || s.isEmpty()) return "";
@@ -1106,135 +1097,32 @@ public class ContextMenuOverlay extends Overlay
         return noTags;
     }
 
-    // Flexible local glossary lookup wrapper:
-    // tries exact, stripped tags, normalized action form, and combined normalized forms.
-    // Note: this method still calls localGlossary.lookup which may perform substring matching,
-    // which is desired for single-token lookups (targets).
-    private String lookupLocalFlexible(String src)
+    private static Color firstColorFromTagged(String tagged, Color fallback)
     {
-        if (src == null) return null;
-        String trimmed = src.trim();
-        if (trimmed.isEmpty()) return null;
-
-        // 1) direct lookup (LocalGlossary will handle case-sensitive & normalized inside)
-        String v = localGlossary.lookup(trimmed);
-        if (v != null)
+        if (tagged == null) return fallback != null ? fallback : Color.WHITE;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)<\\s*col\\s*=\\s*([^>]+)>").matcher(tagged);
+        if (m.find())
         {
-            log.debug("lookupLocalFlexible: direct '{}' -> '{}'", trimmed, v);
-            return v;
-        }
-
-        // 2) strip color tags and retry
-        String stripped = stripColTags(trimmed);
-        if (!stripped.equals(trimmed))
-        {
-            v = localGlossary.lookup(stripped);
-            if (v != null)
+            String v = m.group(1);
+            String hex = v.trim();
+            if ((hex.startsWith("\"") && hex.endsWith("\"")) || (hex.startsWith("'") && hex.endsWith("'")))
+                hex = hex.substring(1, hex.length() - 1).trim();
+            if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
+            if (hex.startsWith("#")) hex = hex.substring(1);
+            hex = hex.replaceAll("[^0-9a-fA-F]", "");
+            if (hex.length() > 6) hex = hex.substring(hex.length() - 6);
+            if (hex.length() == 3) hex = "" + hex.charAt(0) + hex.charAt(0) + hex.charAt(1) + hex.charAt(1) + hex.charAt(2) + hex.charAt(2);
+            if (hex.length() == 4) hex = String.format("%6s", hex).replace(' ', '0');
+            try
             {
-                log.debug("lookupLocalFlexible: stripped '{}' -> '{}'", stripped, v);
-                return v;
+                int val = Integer.parseInt(hex, 16);
+                return new Color((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF);
             }
+            catch (Exception ignored) {}
         }
-
-        // 3) normalized action form (remove tags, replace '-' with space, collapse spaces)
-        String normalizedAction = normalizeAction(stripped);
-        if (!normalizedAction.equals(stripped))
-        {
-            v = localGlossary.lookup(normalizedAction);
-            if (v != null)
-            {
-                log.debug("lookupLocalFlexible: normalized '{}' -> '{}'", normalizedAction, v);
-                return v;
-            }
-        }
-
-        return null;
+        return fallback != null ? fallback : Color.WHITE;
     }
 
-    // tiny pair holder
-    private static class Pair {
-        final String action;
-        final String target;
-        Pair(String a, String t) { this.action = a; this.target = t; }
-    }
-
-    /**
-     * Try to split a combined translation string into (action, target).
-     * Heuristics:
-     *  - If the combinedManual contains '|' (author delimiter), split on first '|'
-     *  - Else if it contains a tab, split on first tab
-     *  - Else split tokens: use number of words in actionPlain (if >0 and < tokens-1),
-     *    otherwise take the first token as action and rest as target.
-     *
-     * Returns null when splitting isn't possible or combinedManual is empty.
-     */
-    private Pair splitCombinedTranslation(String combinedManual, String actionPlain, String cleanTarget)
-    {
-        if (combinedManual == null) return null;
-        String s = combinedManual.trim();
-        if (s.isEmpty()) return null;
-
-        // explicit delimiter preferred (author-friendly)
-        if (s.contains("|"))
-        {
-            String[] p = s.split("\\|", 2);
-            String a = p[0].trim();
-            String t = p.length > 1 ? p[1].trim() : "";
-            return new Pair(a, t);
-        }
-        if (s.contains("\t"))
-        {
-            String[] p = s.split("\\t", 2);
-            String a = p[0].trim();
-            String t = p.length > 1 ? p[1].trim() : "";
-            return new Pair(a, t);
-        }
-
-        // token heuristic: split on word count of source action if available
-        String[] tokens = s.split("\\s+");
-        if (tokens.length == 1)
-        {
-            // only a single token — treat as action, empty target
-            return new Pair(s, "");
-        }
-
-        int actionWords = 0;
-        if (actionPlain != null && !actionPlain.isEmpty())
-        {
-            actionWords = actionPlain.trim().split("\\s+").length;
-        }
-
-        int n = (actionWords > 0 && actionWords < tokens.length) ? actionWords : 1;
-        if (n >= tokens.length) n = Math.max(1, tokens.length - 1);
-
-        StringBuilder aBuilder = new StringBuilder();
-        for (int i = 0; i < n; i++)
-        {
-            if (i > 0) aBuilder.append(' ');
-            aBuilder.append(tokens[i]);
-        }
-        StringBuilder tBuilder = new StringBuilder();
-        for (int i = n; i < tokens.length; i++)
-        {
-            if (i > n) tBuilder.append(' ');
-            tBuilder.append(tokens[i]);
-        }
-
-        String a = aBuilder.toString().trim();
-        String t = tBuilder.toString().trim();
-
-        // sanity: avoid weird empty splits
-        if (a.isEmpty() && !t.isEmpty()) {
-            // flip if target-only (unlikely) -> action = first token of t
-            String[] tt = t.split("\\s+", 2);
-            a = tt[0];
-            t = tt.length > 1 ? tt[1] : "";
-        }
-
-        return new Pair(a, t);
-    }
-
-    // (other utility methods unchanged from your previous file)
     private static String sanitizeColTags(String s)
     {
         if (s == null || s.isEmpty()) return s;
@@ -1332,38 +1220,187 @@ public class ContextMenuOverlay extends Overlay
         return text != null && LEVEL_TAIL.matcher(text).find();
     }
 
-    private static Color firstColorFromTagged(String tagged, Color fallback)
+    // ----------------- New helpers for combined-splitting and lookup -----------------
+
+    // Flexible glossary lookup that tolerates tags, spacing, and some normalization.
+    private String lookupLocalFlexible(String src)
     {
-        if (tagged == null) return fallback != null ? fallback : Color.WHITE;
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("(?i)<\\s*col\\s*=\\s*([^>]+)>")
-                .matcher(tagged);
-        if (m.find())
+        if (src == null) return null;
+        // Try direct (case-sensitive) then normalized/stripped forms.
+        String v = null;
+        try
         {
-            String v = m.group(1);
-            String hex = v.trim();
-            if ((hex.startsWith("\"") && hex.endsWith("\"")) || (hex.startsWith("'") && hex.endsWith("'")))
-                hex = hex.substring(1, hex.length() - 1).trim();
-            if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
-            if (hex.startsWith("#")) hex = hex.substring(1);
-            hex = hex.replaceAll("[^0-9a-fA-F]", "");
-            if (hex.length() > 6) hex = hex.substring(hex.length() - 6);
-            if (hex.length() == 3) hex = "" + hex.charAt(0) + hex.charAt(0) + hex.charAt(1) + hex.charAt(1) + hex.charAt(2) + hex.charAt(2);
-            if (hex.length() == 4) hex = String.format("%6s", hex).replace(' ', '0');
+            v = localGlossary.lookup(src);
+            if (v != null)
+            {
+                log.debug("lookupLocalFlexible: direct '{}' -> '{}'", src, v);
+                return v;
+            }
+        }
+        catch (Exception ex)
+        {
+            log.debug("lookupLocalFlexible direct lookup failed: {}", ex.toString());
+        }
+
+        // strip tags casing preserved
+        String stripped = stripColTags(src);
+        if (!stripped.equals(src))
+        {
             try
             {
-                int val = Integer.parseInt(hex, 16);
-                return new Color((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF);
+                v = localGlossary.lookup(stripped);
+                if (v != null)
+                {
+                    log.debug("lookupLocalFlexible: stripped '{}' -> '{}'", src, v);
+                    return v;
+                }
             }
-            catch (Exception ignored) {}
+            catch (Exception ex)
+            {
+                log.debug("lookupLocalFlexible stripped lookup failed: {}", ex.toString());
+            }
         }
-        return fallback != null ? fallback : Color.WHITE;
+
+        // normalized action form (lowercased normalized)
+        String normalized = normalizeAction(src);
+        if (!normalized.equals(src))
+        {
+            try
+            {
+                v = localGlossary.lookup(normalized);
+                if (v != null)
+                {
+                    log.debug("lookupLocalFlexible: normalized '{}' -> '{}'", src, v);
+                    return v;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.debug("lookupLocalFlexible normalized lookup failed: {}", ex.toString());
+            }
+        }
+
+        // Last resort: try stripped+normalized
+        String strippedNorm = normalizeAction(stripped);
+        if (!strippedNorm.equals(normalized))
+        {
+            try
+            {
+                v = localGlossary.lookup(strippedNorm);
+                if (v != null)
+                {
+                    log.debug("lookupLocalFlexible: stripped+normalized '{}' -> '{}'", src, v);
+                    return v;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.debug("lookupLocalFlexible strippedNorm lookup failed: {}", ex.toString());
+            }
+        }
+
+        return null;
     }
 
-    private static String stripTags(String s)
+    // holder for split parts
+    private static class CombinedParts
     {
-        return s == null ? "" : s.replaceAll("<[^>]*>", "").replace('\u00A0', ' ');
+        final String action;
+        final String target;
+        CombinedParts(String action, String target) { this.action = action; this.target = target; }
     }
 
-    // (rest of helpers left unchanged)
+    /**
+     * Attempt to split a combined translation string into action and target parts.
+     *
+     * Heuristics:
+     * 1) If a translation for cleanTarget exists and combinedManual ends with it -> split.
+     * 2) Else if a translation for actionPlain exists and combinedManual starts with it -> split.
+     * 3) Else try splitting at the last space; if that yields both non-empty parts, use them.
+     *
+     * Always conservative: prefer leaving as whole-line if splitting is doubtful.
+     */
+    private CombinedParts splitCombinedTranslation(String combinedManual, String actionPlain, String cleanTarget)
+    {
+        if (combinedManual == null) return null;
+        String combinedTrim = combinedManual.trim();
+        if (combinedTrim.isEmpty()) return null;
+
+        // 1) target-guided split
+        String tgtManual = lookupLocalFlexible(cleanTarget);
+        if (tgtManual != null && !tgtManual.isEmpty())
+        {
+            String t = tgtManual.trim();
+            if (t.length() > 0)
+            {
+                if (combinedTrim.endsWith(t))
+                {
+                    String a = combinedTrim.substring(0, combinedTrim.length() - t.length()).trim();
+                    // If action part empty, still return null so caller can fallback to whole-line action
+                    return new CombinedParts(a.isEmpty() ? null : a, t);
+                }
+                // try case-insensitive
+                if (combinedTrim.toLowerCase(Locale.ROOT).endsWith(t.toLowerCase(Locale.ROOT)))
+                {
+                    String a = combinedTrim.substring(0, combinedTrim.length() - t.length()).trim();
+                    return new CombinedParts(a.isEmpty() ? null : a, t);
+                }
+            }
+        }
+
+        // 2) action-guided split
+        String actionManual = lookupLocalFlexible(actionPlain);
+        if (actionManual != null && !actionManual.isEmpty())
+        {
+            String aMan = actionManual.trim();
+            if (combinedTrim.startsWith(aMan))
+            {
+                String remainder = combinedTrim.substring(aMan.length()).trim();
+                return new CombinedParts(aMan, remainder.isEmpty() ? null : remainder);
+            }
+            if (combinedTrim.toLowerCase(Locale.ROOT).startsWith(aMan.toLowerCase(Locale.ROOT)))
+            {
+                String remainder = combinedTrim.substring(aMan.length()).trim();
+                return new CombinedParts(aMan, remainder.isEmpty() ? null : remainder);
+            }
+        }
+
+        // 3) fallback: split at the first space (conservative)
+        int spaceIdx = combinedTrim.indexOf(' ');
+        if (spaceIdx > 0 && spaceIdx < combinedTrim.length() - 1)
+        {
+            String a = combinedTrim.substring(0, spaceIdx).trim();
+            String t = combinedTrim.substring(spaceIdx + 1).trim();
+            if (!a.isEmpty() && !t.isEmpty())
+            {
+                return new CombinedParts(a, t);
+            }
+        }
+
+        // nothing sensible
+        return null;
+    }
+
+    // ---------- cache helpers ----------
+    private void initCacheFile()
+    {
+        try
+        {
+            String lang = safeLang(config.targetLang());
+            Path baseDir = net.runelite.client.RuneLite.RUNELITE_DIR.toPath().resolve("ai-translator");
+            Files.createDirectories(baseDir);
+        }
+        catch (Exception e)
+        {
+            log.error("Failed to prepare cache directory/file: {}", e.getMessage());
+        }
+    }
+
+    // The other helper functions (stripTags, getRelevantWidgetsAsList, collectDescendantTextWidgets, etc.)
+    // are assumed unchanged and present in your main plugin file. If you need me to paste them too, say so.
+
+    // NOTE: Keep other utility methods (stripTags, normalizeName, isNameWidget, isLocalPlayerName, seedPerLineCache, etc.)
+    // from your original file in place — I haven't duplicated them here to avoid verbosity. If you want the FULL file
+    // with every helper also reprinted (unchanged), tell me and I will paste the complete file again.
+
 }

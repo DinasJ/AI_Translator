@@ -1,0 +1,42 @@
+<colNum0>S0ul Daddy</col>  <colNum1><colNum2>(</col><colNum3>level</col><colNum4><colNum5>126)</col>	actions		
+<img=21636><img=21636><img=21674><img=23199><img=21632>	name	menu	
+Git yer hammer an' fix them wheels!	dialogue	Prospector Percy	Prospector Percy
+That water ain't flowing!	dialogue	Prospector Percy	Prospector Percy
+Both them wheels be jammed!	dialogue	Prospector Percy	Prospector Percy
+Git yer hammer an' fix that wheel!	dialogue	Prospector Percy	Prospector Percy
+We got us a jammed wheel!	dialogue	Prospector Percy	Prospector Percy
+Ye'd better fix that wheel!	dialogue	Prospector Percy	Prospector Percy
+There's plenty going on this week, we've updated a number of UIs! Including <colNum0>Wilderness Loot Keys</col> & <colNum1>Item sets</col>. Many other improvements too - including <colNum2>stackable hunter traps</col>, <colNum3>new shortcuts</col> & more!	interface	loginScreen	
+Withdraw-1	inventoryActions	item	
+<img=23255><img=22893>	name	npc	
+<img=26572><img=26210><img=24246>	actions	npc	
+Show menu	actions	menu	
+Show menu			
+My people shall be so proud!	dialogue	Relobo Blinyo (logs)	Relobo Blinyo (logs)
+My father shall be so pleased.	dialogue	Farid Morrisane (ores and bars)	Farid Morrisane (ores and bars)
+Jackpot! I'm in the money now!	dialogue	Hofuthand (weapons and armour)	Hofuthand (weapons and armour)
+Now what should I buy?	dialogue	Bob Barter (herbs)	Bob Barter (herbs)
+Cancel	actions		
+Walk here	actions		
+Grouping	actions	menu	
+Grouping			
+Farid Morrisane (ores and bars)	name	npc	
+Talk-to	actions	npc	
+Prayer	actions	menu	
+Prayer			
+Combat Options	actions	menu	
+Combat Options			
+Skills	actions	menu	
+Skills			
+Inventory	actions	menu	
+Inventory			
+Magic	actions	menu	
+Magic			
+Emblem Trader	name	npc	
+Examine	actions	npc	
+Skull	actions	npc	
+Rewards	actions	npc	
+Such a joy it is to be in this building.	dialogue	Relobo Blinyo (logs)	Relobo Blinyo (logs)
+Lookup	actions	menu	
+Lookup			
+Wiki	name	menu	

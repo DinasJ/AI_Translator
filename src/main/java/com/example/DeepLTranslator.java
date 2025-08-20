@@ -44,8 +44,8 @@ public class DeepLTranslator
             return;
         }
 
-        // ✅ Check local glossary first
-        String manual = localGlossary.lookup(text);
+        // ✅ Check local glossary first (EXACT ONLY to avoid ruining long chat lines)
+        String manual = localGlossary.lookupExact(text);
         if (manual != null)
         {
             log.debug("Local glossary hit for '{}': '{}'", text, manual);

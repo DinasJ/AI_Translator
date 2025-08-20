@@ -7,3 +7,6 @@ build
 nbactions.xml
 nb-configuration.xml
 nbproject/
+src/main/java/To_do/To-do.txt
+/src/main/resources/fonts/Runescape-Bold12-ru(old).ttf
+/src/main/resources/fonts/Runescape-Bold12-ru(old not working).ttf

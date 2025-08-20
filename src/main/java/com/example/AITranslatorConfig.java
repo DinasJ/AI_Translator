@@ -47,7 +47,6 @@ public interface AITranslatorConfig extends Config
     {
         return true;
     }
-
     @ConfigItem(
             keyName = "translateDialogue",
             name = "Translate Dialogue",

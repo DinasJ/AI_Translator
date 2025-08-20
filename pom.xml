@@ -14,6 +14,7 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <runelite.version>1.11.14</runelite.version>
     </properties>
 
     <dependencies>
@@ -21,7 +22,7 @@
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
-            <version>1.10.0</version>
+            <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
 
@@ -54,6 +55,12 @@
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <version>1.18.32</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.14.2</version> <!-- optional: match the RuneLite version if you can -->
             <scope>provided</scope>
         </dependency>
     </dependencies>
