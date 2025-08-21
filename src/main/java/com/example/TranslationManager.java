@@ -12,6 +12,10 @@ import java.util.List;
 
 import static com.example.Utils.*;
 
+/**
+ * Handles per-tick translation of widgets, dialog options, and overlays.
+ * Now relies on GlossaryService instead of LocalGlossary.
+ */
 public class TranslationManager
 {
     private static final Logger log = LoggerFactory.getLogger(TranslationManager.class);
@@ -22,7 +26,7 @@ public class TranslationManager
     private final AITranslatorConfig config;
     private final ChatOverlay chatOverlay;
     private final DeepLTranslator translator;
-    private final GlossaryManager glossary;
+    private final GlossaryService glossaryService;
     private final CacheManager cache;
     private final WidgetCollector widgets;
     private final boolean debug;
@@ -37,7 +41,7 @@ public class TranslationManager
             AITranslatorConfig config,
             ChatOverlay chatOverlay,
             DeepLTranslator translator,
-            GlossaryManager glossary,
+            GlossaryService glossaryService,
             CacheManager cache,
             WidgetCollector widgets,
             boolean debug)
@@ -47,7 +51,7 @@ public class TranslationManager
         this.config = config;
         this.chatOverlay = chatOverlay;
         this.translator = translator;
-        this.glossary = glossary;
+        this.glossaryService = glossaryService;
         this.cache = cache;
         this.widgets = widgets;
         this.debug = debug;
@@ -77,18 +81,15 @@ public class TranslationManager
         chatOverlay.markSeen(presentIds, tickCounter);
         chatOverlay.pruneExpired(tickCounter, GRACE_TICKS);
 
-        // Handle options container as a single block
         if (optionsVisible && optionsContainer != null)
         {
             handleOptionsContainer(optionsContainer);
         }
 
-        // Reappeared ids
         Set<Integer> appeared = new HashSet<>(presentIds);
         appeared.removeAll(prevPresentIds);
         handleReappearedWidgets(list, appeared);
 
-        // Regular pass
         handleRegularWidgets(list);
 
         prevPresentIds = presentIds;
@@ -99,7 +100,7 @@ public class TranslationManager
         String combinedPlain = widgets.collectOptionsPlain(optionsContainer);
         int cid = optionsContainer.getId();
 
-        if (combinedPlain.isEmpty()) return;
+        if (combinedPlain == null || combinedPlain.isEmpty()) return;
 
         String last = lastPlainById.get(cid);
         if (!combinedPlain.equals(last))
@@ -110,32 +111,38 @@ public class TranslationManager
             if (cached != null)
             {
                 cache.seedPerLineCache(combinedPlain, cached);
-                String stillCombined = widgets.collectOptionsPlain(optionsContainer);
-                if (combinedPlain.equals(stillCombined))
-                {
-                    chatOverlay.setTranslation(cid, cached);
-                }
+                chatOverlay.setTranslation(cid, cached);
             }
             else
             {
                 final String lang = config.targetLang();
                 log.info("[OPT] Translate request: '{}'", combinedPlain);
-                translator.translateAsync(combinedPlain, lang, translated ->
-                {
-                    String out = (translated == null || translated.isEmpty()) ? combinedPlain : translated;
-                    cache.put(combinedPlain, out);
-                    cache.seedPerLineCache(combinedPlain, out);
-                    log.info("[OPT] Translated: '{}' -> '{}'", combinedPlain, out);
 
-                    clientThread.invokeLater(() ->
-                    {
-                        String stillCombined = widgets.collectOptionsPlain(optionsContainer);
-                        if (combinedPlain.equals(stillCombined))
-                        {
-                            chatOverlay.setTranslation(cid, out);
-                        }
+                String manual = glossaryService.translate(GlossaryService.Type.ACTION, combinedPlain);
+                if (manual != null)
+                {
+                    cache.put(combinedPlain, manual);
+                    cache.seedPerLineCache(combinedPlain, manual);
+                    chatOverlay.setTranslation(cid, manual);
+                    log.info("[OPT] Local glossary hit: '{}' -> '{}'", combinedPlain, manual);
+                }
+                else
+                {
+                    translator.translateAsync(combinedPlain, lang, GlossaryService.Type.ACTION, translated -> {
+                        String out = (translated == null || translated.trim().isEmpty()) ? combinedPlain : translated;
+                        cache.put(combinedPlain, out);
+                        cache.seedPerLineCache(combinedPlain, out);
+                        log.info("[OPT] Translated: '{}' -> '{}'", combinedPlain, out);
+
+                        clientThread.invokeLater(() -> {
+                            String stillCombined = widgets.collectOptionsPlain(optionsContainer);
+                            if (combinedPlain.equals(stillCombined))
+                            {
+                                chatOverlay.setTranslation(cid, out);
+                            }
+                        });
                     });
-                });
+                }
             }
         }
         else
@@ -144,11 +151,7 @@ public class TranslationManager
             if (cached != null)
             {
                 cache.seedPerLineCache(combinedPlain, cached);
-                String stillCombined = widgets.collectOptionsPlain(optionsContainer);
-                if (combinedPlain.equals(stillCombined))
-                {
-                    chatOverlay.setTranslation(cid, cached);
-                }
+                chatOverlay.setTranslation(cid, cached);
             }
         }
     }
@@ -163,13 +166,13 @@ public class TranslationManager
 
             String raw = w.getText();
             String plain = stripTags(raw == null ? "" : raw).trim();
+            if (plain == null || plain.isEmpty()) continue;
 
             if (Utils.isNameWidget(w) && isLocalPlayerName(plain))
             {
                 chatOverlay.setTranslation(id, "");
                 continue;
             }
-            if (plain.isEmpty()) continue;
 
             String cached = cache.get(plain);
             if (cached != null)
@@ -184,30 +187,36 @@ public class TranslationManager
             final String currentPlain = plain;
             log.info("[WIDGET reappear] Translate request: '{}'", currentPlain);
 
-            glossary.lookupExact(currentPlain).ifPresentOrElse(manual ->
+            String manual = glossaryService.translate(GlossaryService.Type.NPC, currentPlain);
+            if (manual != null)
             {
                 cache.put(currentPlain, manual);
-                log.info("[WIDGET reappear] Local glossary (exact) hit: '{}' -> '{}'", currentPlain, manual);
-                clientThread.invokeLater(() ->
-                {
-                    String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                    if (!currentPlain.equals(still)) return;
-                    chatOverlay.setTranslation(wid, manual);
-                    lastPlainById.put(wid, currentPlain);
+                log.info("[WIDGET reappear] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
+                clientThread.invokeLater(() -> {
+                    String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
+                    if (currentPlain.equals(still))
+                    {
+                        chatOverlay.setTranslation(wid, manual);
+                        lastPlainById.put(wid, currentPlain);
+                    }
                 });
-            }, () -> translator.translateAsync(currentPlain, lang, translated ->
+            }
+            else
             {
-                String out = (translated == null || translated.isEmpty()) ? currentPlain : translated;
-                cache.put(currentPlain, out);
-                log.info("[WIDGET reappear] Translated: '{}' -> '{}'", currentPlain, out);
-                clientThread.invokeLater(() ->
-                {
-                    String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                    if (!currentPlain.equals(still)) return;
-                    chatOverlay.setTranslation(wid, out);
-                    lastPlainById.put(wid, currentPlain);
+                translator.translateAsync(currentPlain, lang, GlossaryService.Type.NPC, translated -> {
+                    String out = (translated == null || translated.trim().isEmpty()) ? currentPlain : translated;
+                    cache.put(currentPlain, out);
+                    log.info("[WIDGET reappear] Translated: '{}' -> '{}'", currentPlain, out);
+                    clientThread.invokeLater(() -> {
+                        String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
+                        if (currentPlain.equals(still))
+                        {
+                            chatOverlay.setTranslation(wid, out);
+                            lastPlainById.put(wid, currentPlain);
+                        }
+                    });
                 });
-            }));
+            }
         }
     }
 
@@ -223,6 +232,7 @@ public class TranslationManager
 
             String raw = w.getText();
             String plain = stripTags(raw == null ? "" : raw).trim();
+            if (plain == null || plain.isEmpty()) continue;
 
             if (Utils.isNameWidget(w) && isLocalPlayerName(plain))
             {
@@ -230,7 +240,6 @@ public class TranslationManager
                 chatOverlay.setTranslation(id, "");
                 continue;
             }
-            if (plain.isEmpty()) continue;
 
             String last = lastPlainById.get(id);
             if (plain.equals(last))
@@ -254,30 +263,36 @@ public class TranslationManager
             final String currentPlain = plain;
             log.info("[WIDGET] Translate request: '{}'", currentPlain);
 
-            glossary.lookupExact(currentPlain).ifPresentOrElse(manual ->
+            String manual = glossaryService.translate(GlossaryService.Type.NPC, currentPlain);
+            if (manual != null)
             {
                 cache.put(currentPlain, manual);
-                log.info("[WIDGET] Local glossary (exact) hit: '{}' -> '{}'", currentPlain, manual);
-                clientThread.invokeLater(() ->
-                {
-                    String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                    if (!currentPlain.equals(still)) return;
-                    chatOverlay.setTranslation(wid, manual);
-                    lastPlainById.put(wid, currentPlain);
+                log.info("[WIDGET] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
+                clientThread.invokeLater(() -> {
+                    String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
+                    if (currentPlain.equals(still))
+                    {
+                        chatOverlay.setTranslation(wid, manual);
+                        lastPlainById.put(wid, currentPlain);
+                    }
                 });
-            }, () -> translator.translateAsync(currentPlain, lang, translated ->
+            }
+            else
             {
-                String out = (translated == null || translated.isEmpty()) ? currentPlain : translated;
-                cache.put(currentPlain, out);
-                log.info("[WIDGET] Translated: '{}' -> '{}'", currentPlain, out);
-                clientThread.invokeLater(() ->
-                {
-                    String still = stripTags(w.getText() == null ? "" : w.getText()).trim();
-                    if (!currentPlain.equals(still)) return;
-                    chatOverlay.setTranslation(wid, out);
-                    lastPlainById.put(wid, currentPlain);
+                translator.translateAsync(currentPlain, lang, GlossaryService.Type.NPC, translated -> {
+                    String out = (translated == null || translated.trim().isEmpty()) ? currentPlain : translated;
+                    cache.put(currentPlain, out);
+                    log.info("[WIDGET] Translated: '{}' -> '{}'", currentPlain, out);
+                    clientThread.invokeLater(() -> {
+                        String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
+                        if (currentPlain.equals(still))
+                        {
+                            chatOverlay.setTranslation(wid, out);
+                            lastPlainById.put(wid, currentPlain);
+                        }
+                    });
                 });
-            }));
+            }
         }
     }
 
@@ -287,6 +302,6 @@ public class TranslationManager
         if (lp == null) return false;
         String a = normalizeName(plain);
         String b = normalizeName(lp);
-        return !a.isEmpty() && a.equals(b);
+        return a != null && !a.isEmpty() && a.equals(b);
     }
 }

@@ -33,14 +33,11 @@ public class MenuTranslator
         final String option = safe(entry.getOption());
         final String target = safe(entry.getTarget());
 
-        // Determine entity type for target based on MenuAction
-        final GlossaryService.Type entityType = mapType(entry.getType());
+        final GlossaryService.Type entityType = resolveType(entry.getType());
 
         final String newOption = translateAction(option);
-        final String newTarget = translateTargetPreserveColor(target, entityType);
+        final String newTarget = translateTarget(target, entityType);
 
-        // Modify the existing entry in-place (MenuEntry is abstract / implemented by client),
-        // because creating a concrete instance isn't portable across RuneLite implementations.
         if (!newOption.equals(option) || !newTarget.equals(target))
         {
             try
@@ -57,7 +54,7 @@ public class MenuTranslator
         return entry;
     }
 
-    private GlossaryService.Type mapType(MenuAction type)
+    private GlossaryService.Type resolveType(MenuAction type)
     {
         if (type == null) return GlossaryService.Type.DEFAULT;
         switch (type)
@@ -77,7 +74,7 @@ public class MenuTranslator
             case ITEM_FIFTH_OPTION:
             case ITEM_USE:
             case EXAMINE_ITEM:
-            case WIDGET_TARGET_ON_WIDGET: // many inventory interactions fall here
+            case WIDGET_TARGET_ON_WIDGET:
                 return GlossaryService.Type.ITEM;
 
             case GAME_OBJECT_FIRST_OPTION:
@@ -104,28 +101,19 @@ public class MenuTranslator
     {
         if (option.isEmpty()) return option;
 
-        // First try glossary (synchronous)
         String g = glossary.translate(GlossaryService.Type.ACTION, option);
-
-        // If glossary produced translation different from input, preserve original casing style
-        if (!equalsIgnoreCaseTrim(g, option))
-        {
-            return matchCase(option, g);
-        }
-
         return matchCase(option, g);
     }
 
-    private String translateTargetPreserveColor(String target, GlossaryService.Type type)
+    private String translateTarget(String target, GlossaryService.Type type)
     {
         if (target.isEmpty()) return target;
 
-        // Extract leading color tag and trailing reset, if present
         String leading = "";
         String trailing = "";
         String inner = target;
 
-        // RuneLite target usually like <col=ffff00>Goblin</col>
+        // If it already has a single <col=xxxxxx>...</col>, unwrap it
         if (inner.matches("^<col=[0-9a-fA-F]{6}>.*</col>$"))
         {
             int gt = inner.indexOf('>') + 1;
@@ -135,23 +123,40 @@ public class MenuTranslator
         }
 
         String g = glossary.translate(type, inner);
-
-        // If glossary returned an actual translation different from inner, preserve casing
-        if (!equalsIgnoreCaseTrim(g, inner))
-        {
-            g = matchCase(inner, g);
-        }
+        g = matchCase(inner, g);
 
         return leading + g + trailing;
     }
 
-    private void triggerAsyncDeepL(String src, java.util.function.Consumer<String> store)
+    private void triggerAsyncDeepL(String src, GlossaryService.Type type, java.util.function.Consumer<String> store)
     {
         try
         {
             final String lang = safeLang(config.targetLang());
             if (lang.isEmpty()) return;
-            deepL.translateAsync(src, lang, store);
+
+            // Map GlossaryService.Type to GlossaryService.Type
+            GlossaryService.Type glossaryType;
+            switch (type)
+            {
+                case ACTION:
+                    glossaryType = GlossaryService.Type.ACTION;
+                    break;
+                case NPC:
+                    glossaryType = GlossaryService.Type.NPC;
+                    break;
+                case ITEM:
+                    glossaryType = GlossaryService.Type.ITEM;
+                    break;
+                case OBJECT:
+                    glossaryType = GlossaryService.Type.OBJECT;
+                    break;
+                default:
+                    glossaryType = GlossaryService.Type.DEFAULT;
+                    break;
+            }
+
+            deepL.translateAsync(src, lang, glossaryType, store);
         }
         catch (Exception ex)
         {
@@ -175,16 +180,11 @@ public class MenuTranslator
     private static String safeLang(String s)
     {
         if (s == null) return "";
-        String x = s.trim().toUpperCase(Locale.ROOT);
-        // DeepL expects e.g., RU, EN-GB, etc. Let config drive exact value.
-        return x;
+        return s.trim().toUpperCase(Locale.ROOT);
     }
 
     /**
      * Preserve capitalization style from the source when applying the translation.
-     * - If source is ALL UPPER -> return target uppercased.
-     * - If source is Capitalized (First upper, rest lower) -> capitalize target similarly.
-     * - Otherwise return target as-is.
      */
     private static String matchCase(String src, String target)
     {
@@ -208,27 +208,19 @@ public class MenuTranslator
 
         return target;
     }
+
     /**
-     * Translates just the option text of a MenuEntry for overlay display,
-     * without touching the target or the actual MenuEntry object.
+     * Translates just the option text for overlay display (doesn't modify MenuEntry).
      */
     public String translateOptionOnly(String option, String target)
     {
         if (option == null) return "";
 
-        // First try glossary translation
         String translated = glossary.translate(GlossaryService.Type.ACTION, option);
-
-        // Preserve capitalization style
         translated = matchCase(option, translated);
 
-        // Optionally, you could trigger async DeepL here if needed
-        // triggerAsyncDeepL(option, s -> deeplCache.put(cacheKey("overlay", option), s));
-
-        // Logging for debugging
         log.debug("translateOptionOnly: '{}' -> '{}'", option, translated);
 
         return translated;
     }
-
 }

@@ -10,11 +10,12 @@ import org.slf4j.LoggerFactory;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
+import java.util.Locale;
 import java.util.function.Consumer;
 
 /**
  * A service for asynchronous translation using the DeepL API.
- * Handles local glossary lookups, HTTP requests, and JSON parsing.
+ * Checks glossary first, falls back to DeepL API if needed.
  */
 @Singleton
 public class DeepLTranslator
@@ -24,19 +25,24 @@ public class DeepLTranslator
 
     private final OkHttpClient client = new OkHttpClient();
     private final AITranslatorConfig config;
-    private final LocalGlossary localGlossary;
+    private final GlossaryService glossaryService;
 
     @Inject
-    public DeepLTranslator(AITranslatorConfig config, LocalGlossary localGlossary)
+    public DeepLTranslator(AITranslatorConfig config, GlossaryService glossaryService)
     {
         this.config = config;
-        this.localGlossary = localGlossary;
+        this.glossaryService = glossaryService;
     }
 
     /**
      * Non-blocking translation call with a callback.
+     *
+     * @param text         The text to translate.
+     * @param targetLang   The target language (e.g., "RU").
+     * @param glossaryType The glossary type to check first.
+     * @param callback     Callback that receives the translated text.
      */
-    public void translateAsync(String text, String targetLang, Consumer<String> callback)
+    public void translateAsync(String text, String targetLang, GlossaryService.Type glossaryType, Consumer<String> callback)
     {
         if (text == null || text.isEmpty())
         {
@@ -44,27 +50,28 @@ public class DeepLTranslator
             return;
         }
 
-        // ✅ Check local glossary first (EXACT ONLY to avoid ruining long chat lines)
-        String manual = localGlossary.lookupExact(text);
-        if (manual != null)
+        // ✅ Glossary first
+        String manual = glossaryService.translate(glossaryType, text);
+        if (manual != null && !manual.isEmpty())
         {
-            log.debug("Local glossary hit for '{}': '{}'", text, manual);
-            callback.accept(manual);
+            log.debug("[DeepL] Local glossary hit ({}): '{}' -> '{}'", glossaryType, text, manual);
+            callback.accept(matchCase(text, manual));
             return;
         }
 
+        // ✅ Ensure API key exists
         String apiKey = config.deeplApiKey();
         if (apiKey == null || apiKey.isEmpty())
         {
-            log.error("DeepL API key is not configured.");
+            log.warn("[DeepL] API key missing, returning original text: '{}'", text);
             callback.accept(text);
             return;
         }
 
-        FormBody body = new FormBody.Builder()
+        RequestBody body = new FormBody.Builder()
                 .add("auth_key", apiKey)
                 .add("text", text)
-                .add("target_lang", targetLang)
+                .add("target_lang", safeLang(targetLang))
                 .add("source_lang", "EN")
                 .build();
 
@@ -78,54 +85,85 @@ public class DeepLTranslator
             @Override
             public void onFailure(Call call, IOException e)
             {
-                log.error("DeepL translation request failed: {}", e.getMessage());
-                try { callback.accept(text); } catch (Exception ignored) {}
+                log.error("[DeepL] Request failed: {}", e.getMessage());
+                safeAccept(callback, text);
             }
 
             @Override
-            public void onResponse(Call call, Response response) throws IOException
+            public void onResponse(Call call, Response response)
             {
                 try (Response res = response)
                 {
                     if (!res.isSuccessful())
                     {
-                        log.error("DeepL API returned code {} with message {}", res.code(), res.message());
-                        callback.accept(text);
+                        log.error("[DeepL] API returned {} {}", res.code(), res.message());
+                        safeAccept(callback, text);
                         return;
                     }
 
                     ResponseBody rb = res.body();
                     if (rb == null)
                     {
-                        log.error("DeepL API response body was null");
-                        callback.accept(text);
+                        log.error("[DeepL] Response body null");
+                        safeAccept(callback, text);
                         return;
                     }
 
                     String json = rb.string();
-                    // ✅ Old-style JsonParser call
-                    JsonElement element = new JsonParser().parse(json);
-
-                    if (element == null || !element.isJsonObject())
+                    JsonElement element = JsonParser.parseString(json);
+                    if (!element.isJsonObject())
                     {
-                        log.error("Invalid JSON from DeepL: {}", json);
-                        callback.accept(text);
+                        log.error("[DeepL] Invalid JSON: {}", json);
+                        safeAccept(callback, text);
                         return;
                     }
 
                     JsonObject obj = element.getAsJsonObject();
-                    String translatedText = obj.getAsJsonArray("translations")
+                    String translated = obj.getAsJsonArray("translations")
                             .get(0).getAsJsonObject()
                             .get("text").getAsString();
 
-                    callback.accept(translatedText);
+                    log.debug("[DeepL] '{}' -> '{}'", text, translated);
+                    safeAccept(callback, matchCase(text, translated));
                 }
                 catch (Exception e)
                 {
-                    log.error("Error parsing DeepL response: {}", e.getMessage());
-                    callback.accept(text);
+                    log.error("[DeepL] Error parsing response: {}", e.getMessage());
+                    safeAccept(callback, text);
                 }
             }
         });
+    }
+
+    private static void safeAccept(Consumer<String> cb, String value)
+    {
+        try { cb.accept(value); } catch (Exception ignored) {}
+    }
+
+    private static String safeLang(String s)
+    {
+        return s == null ? "EN" : s.trim().toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Preserve capitalization style from the source when applying the translation.
+     */
+    private static String matchCase(String src, String target)
+    {
+        if (src == null || src.isEmpty() || target == null || target.isEmpty()) return target;
+
+        if (src.equals(src.toUpperCase(Locale.ROOT)))
+        {
+            return target.toUpperCase(Locale.ROOT);
+        }
+
+        if (Character.isUpperCase(src.charAt(0)) &&
+                src.substring(1).equals(src.substring(1).toLowerCase(Locale.ROOT)))
+        {
+            return target.substring(0, 1).toUpperCase(Locale.ROOT) +
+                    (target.length() > 1 ? target.substring(1).toLowerCase(Locale.ROOT) : "");
+        }
+
+        return target;
     }
 }

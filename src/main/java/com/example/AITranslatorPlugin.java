@@ -56,7 +56,7 @@ public class AITranslatorPlugin extends Plugin
     @Inject private LocalGlossary localGlossary;
 
     // Managers (may be present or null depending on your project)
-    private GlossaryManager glossary;
+    private GlossaryService glossary;
     private CacheManager cacheManager;
     private WidgetCollector widgetCollector;
     private TranslationManager translationManager;
@@ -120,8 +120,9 @@ public class AITranslatorPlugin extends Plugin
         // Managers + scheduler kept minimal for this test; existing components may be initialized elsewhere
         try
         {
-            glossary = new GlossaryManager(localGlossary);
-            glossary.loadFromResource("/glossary/osrs_action_glossary.tsv");
+            glossary = new GlossaryService();
+
+            log.info("Glossaries loaded into GlossaryService:");
         }
         catch (Exception e)
         {
