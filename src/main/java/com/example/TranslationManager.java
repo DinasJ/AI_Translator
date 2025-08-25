@@ -7,301 +7,333 @@ import net.runelite.client.callback.ClientThread;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.awt.*;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static com.example.Utils.*;
 
 /**
- * Handles per-tick translation of widgets, dialog options, and overlays.
- * Now relies on GlossaryService instead of LocalGlossary.
+ * Central manager for collecting, translating and caching RuneLite widget texts.
  */
+@Singleton
 public class TranslationManager
 {
     private static final Logger log = LoggerFactory.getLogger(TranslationManager.class);
-    private static final int GRACE_TICKS = 3;
 
     private final Client client;
     private final ClientThread clientThread;
-    private final AITranslatorConfig config;
-    private final ChatOverlay chatOverlay;
-    private final DeepLTranslator translator;
-    private final GlossaryService glossaryService;
-    private final CacheManager cache;
-    private final WidgetCollector widgets;
+    private final DeepLTranslator deepl;
+    private final GlossaryService glossary;
+    private final CacheManager cacheManager;
     private final boolean debug;
 
-    private final Map<Integer, String> lastPlainById = new HashMap<>();
-    private Set<Integer> prevPresentIds = new HashSet<>();
-    private int tickCounter = 0;
+    // text → ongoing request timestamp
+    private final Map<String, Long> inFlight = new ConcurrentHashMap<>();
+    // widgetId → last plain text
+    private final Map<Integer, String> lastSeen = new ConcurrentHashMap<>();
 
+    private final TranslationOverlay translationOverlay;
+
+    @Inject
     public TranslationManager(
             Client client,
             ClientThread clientThread,
-            AITranslatorConfig config,
-            ChatOverlay chatOverlay,
-            DeepLTranslator translator,
-            GlossaryService glossaryService,
-            CacheManager cache,
-            WidgetCollector widgets,
+            DeepLTranslator deepl,
+            GlossaryService glossary,
+            CacheManager cacheManager,
+            TranslationOverlay translationOverlay,
             boolean debug)
     {
         this.client = client;
         this.clientThread = clientThread;
-        this.config = config;
-        this.chatOverlay = chatOverlay;
-        this.translator = translator;
-        this.glossaryService = glossaryService;
-        this.cache = cache;
-        this.widgets = widgets;
+        this.deepl = deepl;
+        this.glossary = glossary;
+        this.cacheManager = cacheManager;
+        this.translationOverlay = translationOverlay;
         this.debug = debug;
+    }
+
+    /** Called every scheduled tick from AITranslatorPlugin. */
+    public void tick()
+    {
+        if (debug)
+            log.debug("[TM.tick] inFlight={} lastSeen={} cacheDirtySaveCheck", inFlight.size(), lastSeen.size());
+        cacheManager.saveIfDirty();
+    }
+
+    /**
+     * Translate a single widget, apply from cache immediately if possible,
+     * otherwise send async request.
+     */
+    public void updateWidgetTranslation(WidgetCollector.CollectedWidget cw)
+    {
+        if (cw == null) return;
+
+        if (debug)
+        {
+            log.debug("[TM.updateWidgetTranslation] widgetId={} type={} plain='{}'",
+                    cw.id(), cw.type(), truncate(cw.plainText()));
+        }
+
+        applyCachedOrQueue(cw.widget(), cw.plainText(), cw.type());
+    }
+
+    public void updateWidgetTranslation(Widget widget, GlossaryService.Type type)
+    {
+        if (widget == null) return;
+
+        // Special-case: dialog options container — iterate children instead of combining
+        if (isOptionsContainer(widget))
+        {
+            // Descend to find actual text-bearing descendants (rows)
+            List<Widget> textRows = new ArrayList<>(6);
+            ArrayDeque<Widget> q = new ArrayDeque<>();
+            q.add(widget);
+
+            while (!q.isEmpty() && textRows.size() < 6)
+            {
+                Widget cur = q.poll();
+                if (cur == null || cur.isHidden()) continue;
+
+                // Enqueue both dynamic and static children
+                Widget[] dyn = cur.getDynamicChildren();
+                if (dyn != null) for (Widget c : dyn) if (c != null) q.add(c);
+                Widget[] stat = cur.getChildren();
+                if (stat != null) for (Widget c : stat) if (c != null) q.add(c);
+
+                if (cur == widget) continue;
+
+                String plain = Utils.toPlainText(cur);
+                Rectangle b = cur.getBounds();
+                if (plain != null && !plain.trim().isEmpty() &&
+                        b != null && b.width > 0 && b.height > 0)
+                {
+                    textRows.add(cur);
+                }
+            }
+
+            // Sort visually to keep order stable
+            textRows.sort((a, b) -> {
+                Rectangle ra = a.getBounds(), rb = b.getBounds();
+                if (ra == null || rb == null) return 0;
+                int dy = Integer.compare(ra.y, rb.y);
+                return dy != 0 ? dy : Integer.compare(ra.x, rb.x);
+            });
+
+            if (!textRows.isEmpty())
+            {
+                for (Widget r : textRows)
+                {
+                    String plain = Utils.toPlainText(r);
+                    if (plain == null || plain.trim().isEmpty()) {
+                        translationOverlay.updateTranslation(r, null);
+                        lastSeen.remove(r.getId());
+                        continue;
+                    }
+
+                    if (debug)
+                        log.debug("[TM.updateWidgetTranslation][OPTIONS:row] widgetId={} plain='{}'",
+                                r.getId(), truncate(plain));
+
+                    applyCachedOrQueue(r, plain, GlossaryService.Type.ACTION);
+                }
+            }
+            else
+            {
+                // Fallback: some clients render all lines in container text
+                String combined = Utils.toPlainText(widget);
+                if (combined == null || combined.trim().isEmpty())
+                {
+                    translationOverlay.updateTranslation(widget, null);
+                    lastSeen.remove(widget.getId());
+                }
+                else
+                {
+                    if (debug)
+                        log.debug("[TM.updateWidgetTranslation][OPTIONS:combined] widgetId={} plain='{}'",
+                                widget.getId(), truncate(combined));
+
+                    applyCachedOrQueue(widget, combined, GlossaryService.Type.ACTION);
+                }
+            }
+            return;
+        }
+
+        // Normal widgets
+        String plain = Utils.toPlainText(widget);
+
+        // PATCH: if empty → clear overlay instead of skipping silently
+        if (plain == null || plain.isEmpty())
+        {
+            if (debug)
+                log.debug("[TM.updateWidgetTranslation] clear empty widgetId={} type={}",
+                        (widget != null ? widget.getId() : -1), type);
+
+            if (widget != null)
+            {
+                translationOverlay.updateTranslation(widget, null);
+                lastSeen.remove(widget.getId());
+            }
+            return;
+        }
+
+        if (debug)
+            log.debug("[TM.updateWidgetTranslation] widgetId={} type={} plain='{}'",
+                    widget.getId(), type, truncate(plain));
+
+        applyCachedOrQueue(widget, plain, type);
+    }
+
+    /**
+     * Called from the WidgetCollector results each game tick.
+     */
+    // Helpers for options container handling
+
+    private boolean isOptionsContainer(Widget w)
+    {
+        if (w == null) return false;
+        int id = w.getId();
+        // WidgetInfo.DIALOG_OPTION_OPTIONS (219:1) — guard by both id and group/child for safety
+        int group = (id >>> 16), child = (id & 0xFFFF);
+        return id == net.runelite.api.widgets.WidgetInfo.DIALOG_OPTION_OPTIONS.getId()
+                || (group == 219 && child == 1);
+    }
+    /**
+     * Applies cached translation to the overlay or queues an async translation by widgetId+text.
+     * This path is used when we don't hold a strong Widget reference but know its id and text.
+     */
+    public void applyCachedOrQueue(Widget widget, String plain, GlossaryService.Type type)
+    {
+        if (plain == null || plain.isEmpty())
+        {
+            if (debug) log.debug("[TM.applyCachedOrQueue] clear empty id={} type={}", widget, type);
+            translationOverlay.updateTranslation(widget, null); // PATCH: actively clear
+            lastSeen.remove(widget.getId());
+            return;
+        }
+
+        int wid = widget.getId();
+        String prev = lastSeen.get(wid);
+        if (prev != null && !prev.equals(plain))
+        {
+            if (debug)
+                log.debug("[TM.applyCachedOrQueue] text changed for widgetId={} old='{}' new='{}' -> clearing overlay",
+                        wid, truncate(prev), truncate(plain));
+            clientThread.invoke(() -> translationOverlay.updateTranslation(widget, null)); // clear old
+        }
+        lastSeen.put(wid, plain);
+
+        String norm = normalizeName(plain);
+        if (debug) log.debug("[TM.applyCachedOrQueue] id={} type={} plain='{}' norm='{}'", widget, type, truncate(plain), truncate(norm));
+
+        // 1) Try cache (plain and normalized)
+        String cached = getCached(plain, norm);
+        if (cached != null)
+        {
+            if (debug)
+                log.debug("[CACHE APPLY] widget={} key='{}' -> '{}'",
+                        widget, truncate(plain), truncate(cached));
+
+            clientThread.invoke(() -> translationOverlay.updateTranslation(widget, cached));
+            return;
+        }
+
+        // 2) Deduplicate in-flight requests based on normalized key
+        if (inFlight.containsKey(norm))
+        {
+            if (debug)
+                log.debug("[INFLIGHT] widget={} key='{}'", widget, truncate(plain));
+            return;
+        }
+
+        inFlight.put(norm, System.currentTimeMillis());
+        if (debug) log.debug("[TM.applyCachedOrQueue] queued translateAsync id={} lang=RU type={} key='{}'", widget, type, truncate(norm));
+
+        // 3) Async translation
+        deepl.translateAsync(plain, "RU", type, translated -> {
+            inFlight.remove(norm);
+
+            if (translated == null || translated.isEmpty())
+            {
+                log.warn("[DEEPL FAIL] widget={} key='{}'", widget, truncate(plain));
+                return;
+            }
+
+            String withGlossary = glossary.translate(type, translated);
+
+            cacheManager.put(plain, withGlossary);
+            cacheManager.put(norm, withGlossary);
+
+            if (debug)
+                log.debug("[CACHE STORE] widget={} plain='{}' norm='{}' -> '{}'",
+                        widget, truncate(plain), truncate(norm), truncate(withGlossary));
+
+            clientThread.invoke(() -> translationOverlay.updateTranslation(widget, withGlossary));
+        });
     }
 
     public void clearState()
     {
-        lastPlainById.clear();
-        prevPresentIds.clear();
-        tickCounter = 0;
-        chatOverlay.clearAllTranslations();
+        inFlight.clear();
+        lastSeen.clear();
     }
 
-    public void tick()
+    private String getCached(String plain, String norm)
     {
-        tickCounter++;
-
-        Widget optionsContainer = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
-        boolean optionsVisible = optionsContainer != null && !optionsContainer.isHidden();
-
-        List<Widget> list = widgets.getRelevantWidgetsAsList(optionsVisible);
-        chatOverlay.updateSourceWidgets(list);
-
-        Set<Integer> presentIds = new HashSet<>();
-        for (Widget w : list) presentIds.add(w.getId());
-
-        chatOverlay.markSeen(presentIds, tickCounter);
-        chatOverlay.pruneExpired(tickCounter, GRACE_TICKS);
-
-        if (optionsVisible && optionsContainer != null)
+        String v1 = cacheManager.get(plain);
+        if (v1 != null)
         {
-            handleOptionsContainer(optionsContainer);
+            if (debug) log.debug("[CACHE HIT:plain] key='{}' -> '{}'", truncate(plain), truncate(v1));
+            return v1;
         }
 
-        Set<Integer> appeared = new HashSet<>(presentIds);
-        appeared.removeAll(prevPresentIds);
-        handleReappearedWidgets(list, appeared);
+        String v2 = cacheManager.get(norm);
+        if (v2 != null)
+        {
+            if (debug) log.debug("[CACHE HIT:norm] key='{}' -> '{}'", truncate(norm), truncate(v2));
+            return v2;
+        }
 
-        handleRegularWidgets(list);
-
-        prevPresentIds = presentIds;
+        if (debug) log.debug("[CACHE MISS] plain='{}' norm='{}'", truncate(plain), truncate(norm));
+        return null;
     }
 
-    private void handleOptionsContainer(Widget optionsContainer)
+    public boolean shouldProcessScript(int scriptId)
     {
-        String combinedPlain = widgets.collectOptionsPlain(optionsContainer);
-        int cid = optionsContainer.getId();
+        return scriptId == 80 || scriptId == 664 || scriptId == 6009 || scriptId == 222;
+    }
 
-        if (combinedPlain == null || combinedPlain.isEmpty()) return;
 
-        String last = lastPlainById.get(cid);
-        if (!combinedPlain.equals(last))
+    // Step 2: actually process the widgets (no more hardcoded IDs)
+    public void processRelevantWidgets(WidgetCollector collector, int scriptId)
+    {
+        if (debug) log.debug("Processing relevant widgets for translation");
+
+        try
         {
-            lastPlainById.put(cid, combinedPlain);
+            clientThread.invokeLater(() -> {
+                List<WidgetCollector.CollectedWidget> widgets = collector.getRelevantCollectedWidgets(scriptId);
+                if (debug) log.debug("[TM] collected {} widgets to update", widgets.size());
 
-            String cached = cache.get(combinedPlain);
-            if (cached != null)
-            {
-                cache.seedPerLineCache(combinedPlain, cached);
-                chatOverlay.setTranslation(cid, cached);
-            }
-            else
-            {
-                final String lang = config.targetLang();
-                log.info("[OPT] Translate request: '{}'", combinedPlain);
-
-                String manual = glossaryService.translate(GlossaryService.Type.ACTION, combinedPlain);
-                if (manual != null)
+                for (WidgetCollector.CollectedWidget cw : widgets)
                 {
-                    cache.put(combinedPlain, manual);
-                    cache.seedPerLineCache(combinedPlain, manual);
-                    chatOverlay.setTranslation(cid, manual);
-                    log.info("[OPT] Local glossary hit: '{}' -> '{}'", combinedPlain, manual);
+                    updateWidgetTranslation(cw.widget(), cw.type());
                 }
-                else
-                {
-                    translator.translateAsync(combinedPlain, lang, GlossaryService.Type.ACTION, translated -> {
-                        String out = (translated == null || translated.trim().isEmpty()) ? combinedPlain : translated;
-                        cache.put(combinedPlain, out);
-                        cache.seedPerLineCache(combinedPlain, out);
-                        log.info("[OPT] Translated: '{}' -> '{}'", combinedPlain, out);
 
-                        clientThread.invokeLater(() -> {
-                            String stillCombined = widgets.collectOptionsPlain(optionsContainer);
-                            if (combinedPlain.equals(stillCombined))
-                            {
-                                chatOverlay.setTranslation(cid, out);
-                            }
-                        });
-                    });
-                }
-            }
+                try {
+                    if (client.getCanvas() != null) client.getCanvas().repaint();
+                } catch (Throwable ignored) {}
+            });
         }
-        else
+        catch (Exception ex)
         {
-            String cached = cache.get(combinedPlain);
-            if (cached != null)
-            {
-                cache.seedPerLineCache(combinedPlain, cached);
-                chatOverlay.setTranslation(cid, cached);
-            }
+            if (debug) log.debug("clientThread.invoke failed during widget processing: {}", ex.toString());
+            clientThread.invokeLater(() -> {});
         }
-    }
-
-    private void handleReappearedWidgets(List<Widget> widgetsList, Set<Integer> appeared)
-    {
-        for (Widget w : widgetsList)
-        {
-            if (w == null || w.isHidden()) continue;
-            int id = w.getId();
-            if (!appeared.contains(id)) continue;
-
-            String raw = w.getText();
-            String plain = stripTags(raw == null ? "" : raw).trim();
-            if (plain == null || plain.isEmpty()) continue;
-
-            if (Utils.isNameWidget(w) && isLocalPlayerName(plain))
-            {
-                chatOverlay.setTranslation(id, "");
-                continue;
-            }
-
-            String cached = cache.get(plain);
-            if (cached != null)
-            {
-                chatOverlay.setTranslation(id, cached);
-                lastPlainById.put(id, plain);
-                continue;
-            }
-
-            final String lang = config.targetLang();
-            final int wid = id;
-            final String currentPlain = plain;
-            log.info("[WIDGET reappear] Translate request: '{}'", currentPlain);
-
-            String manual = glossaryService.translate(GlossaryService.Type.NPC, currentPlain);
-            if (manual != null)
-            {
-                cache.put(currentPlain, manual);
-                log.info("[WIDGET reappear] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
-                clientThread.invokeLater(() -> {
-                    String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
-                    if (currentPlain.equals(still))
-                    {
-                        chatOverlay.setTranslation(wid, manual);
-                        lastPlainById.put(wid, currentPlain);
-                    }
-                });
-            }
-            else
-            {
-                translator.translateAsync(currentPlain, lang, GlossaryService.Type.NPC, translated -> {
-                    String out = (translated == null || translated.trim().isEmpty()) ? currentPlain : translated;
-                    cache.put(currentPlain, out);
-                    log.info("[WIDGET reappear] Translated: '{}' -> '{}'", currentPlain, out);
-                    clientThread.invokeLater(() -> {
-                        String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
-                        if (currentPlain.equals(still))
-                        {
-                            chatOverlay.setTranslation(wid, out);
-                            lastPlainById.put(wid, currentPlain);
-                        }
-                    });
-                });
-            }
-        }
-    }
-
-    private void handleRegularWidgets(List<Widget> widgetsList)
-    {
-        for (Widget w : widgetsList)
-        {
-            if (w == null || w.isHidden()) continue;
-
-            int id = w.getId();
-            int grp = (id >>> 16), child = (id & 0xFFFF);
-            if (grp == 219 && child == 1) continue;
-
-            String raw = w.getText();
-            String plain = stripTags(raw == null ? "" : raw).trim();
-            if (plain == null || plain.isEmpty()) continue;
-
-            if (Utils.isNameWidget(w) && isLocalPlayerName(plain))
-            {
-                lastPlainById.put(id, plain);
-                chatOverlay.setTranslation(id, "");
-                continue;
-            }
-
-            String last = lastPlainById.get(id);
-            if (plain.equals(last))
-            {
-                String cached = cache.get(plain);
-                if (cached != null) chatOverlay.setTranslation(id, cached);
-                continue;
-            }
-
-            lastPlainById.put(id, plain);
-
-            String cached = cache.get(plain);
-            if (cached != null)
-            {
-                chatOverlay.setTranslation(id, cached);
-                continue;
-            }
-
-            final String lang = config.targetLang();
-            final int wid = id;
-            final String currentPlain = plain;
-            log.info("[WIDGET] Translate request: '{}'", currentPlain);
-
-            String manual = glossaryService.translate(GlossaryService.Type.NPC, currentPlain);
-            if (manual != null)
-            {
-                cache.put(currentPlain, manual);
-                log.info("[WIDGET] Local glossary hit: '{}' -> '{}'", currentPlain, manual);
-                clientThread.invokeLater(() -> {
-                    String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
-                    if (currentPlain.equals(still))
-                    {
-                        chatOverlay.setTranslation(wid, manual);
-                        lastPlainById.put(wid, currentPlain);
-                    }
-                });
-            }
-            else
-            {
-                translator.translateAsync(currentPlain, lang, GlossaryService.Type.NPC, translated -> {
-                    String out = (translated == null || translated.trim().isEmpty()) ? currentPlain : translated;
-                    cache.put(currentPlain, out);
-                    log.info("[WIDGET] Translated: '{}' -> '{}'", currentPlain, out);
-                    clientThread.invokeLater(() -> {
-                        String still = stripTags(Optional.ofNullable(w.getText()).orElse("")).trim();
-                        if (currentPlain.equals(still))
-                        {
-                            chatOverlay.setTranslation(wid, out);
-                            lastPlainById.put(wid, currentPlain);
-                        }
-                    });
-                });
-            }
-        }
-    }
-
-    private boolean isLocalPlayerName(String plain)
-    {
-        String lp = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null;
-        if (lp == null) return false;
-        String a = normalizeName(plain);
-        String b = normalizeName(lp);
-        return a != null && !a.isEmpty() && a.equals(b);
     }
 }

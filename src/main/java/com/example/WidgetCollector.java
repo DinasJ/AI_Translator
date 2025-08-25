@@ -10,7 +10,7 @@ import java.awt.*;
 import java.util.*;
 import java.util.List;
 
-import static com.example.Utils.stripTags;
+import static com.example.Utils.*;
 
 public class WidgetCollector
 {
@@ -18,172 +18,166 @@ public class WidgetCollector
     private final Client client;
     private final boolean debug;
 
+    public static class CollectedWidget
+    {
+        private final Widget widget;
+        private final GlossaryService.Type type;
+        private final String plainText;
+
+        public CollectedWidget(Widget widget, GlossaryService.Type type, String plainText)
+        {
+            this.widget = widget;
+            this.type = type;
+            this.plainText = plainText;
+        }
+
+        public Widget widget() { return widget; }
+        public GlossaryService.Type type() { return type; }
+        public String plainText() { return plainText; }
+        public int id() { return widget.getId(); }
+    }
+
     public WidgetCollector(Client client, boolean debug)
     {
         this.client = client;
         this.debug = debug;
     }
 
-    /** Collect all visible option row texts into a single plain string separated by newlines, sorted by Y then X */
-    public String collectOptionsPlain(Widget optionsContainer)
+    /* ========= Entry point for TranslationManager ========= */
+
+    public List<CollectedWidget> getRelevantCollectedWidgets(int scriptId)
     {
-        Widget[] rows = optionsContainer.getDynamicChildren();
-        if (rows == null || rows.length == 0) rows = optionsContainer.getChildren();
-        if (rows == null || rows.length == 0) rows = optionsContainer.getStaticChildren();
+        if (debug) log.debug("[Collector] scan start for script={}", scriptId);
+        Map<String, CollectedWidget> collected = new LinkedHashMap<>();
 
-        if (rows == null || rows.length == 0) return "";
+        switch (scriptId)
+        {
+            case 80:
+                collectChatbox(collected);
+                collectOptions(collected);
+                collectFallbackDialogue(collected);
+                break;
+            case 222:
+                collectChatbox(collected);
+                collectFallbackDialogue(collected);
+                break;
+            case 664:
+                collectOptions(collected);
+                break;
+            case 6009:
+                collectFallbackDialogue(collected);
+                break;
+            default:
+                if (debug) log.trace("Script {} not relevant for widget collection", scriptId);
+                break;
+        }
 
-        List<Widget> ordered = new ArrayList<>(rows.length);
-        for (Widget r : rows) if (r != null && !r.isHidden()) ordered.add(r);
-        ordered.sort((a, b) -> {
-            Rectangle ra = a.getBounds(), rb = b.getBounds();
-            int ay = ra == null ? Integer.MAX_VALUE : ra.y;
-            int by = rb == null ? Integer.MAX_VALUE : rb.y;
-            if (ay != by) return Integer.compare(ay, by);
-            int ax = ra == null ? Integer.MAX_VALUE : ra.x;
-            int bx = rb == null ? Integer.MAX_VALUE : rb.x;
-            return Integer.compare(ax, bx);
+        // Remove blacklisted
+        collected.values().removeIf(cw ->
+                cw.widget() == null ||
+                        cw.widget().isHidden() ||
+                        isBlacklisted(cw.widget().getId()));
+
+        // Sort visually
+        List<CollectedWidget> result = new ArrayList<>(collected.values());
+        result.sort((a, b) -> {
+            Rectangle ra = a.widget().getBounds();
+            Rectangle rb = b.widget().getBounds();
+            if (ra == null || rb == null) return 0;
+            int dy = Integer.compare(ra.y, rb.y);
+            return dy != 0 ? dy : Integer.compare(ra.x, rb.x);
         });
 
-        StringBuilder sb = new StringBuilder();
-        int count = 0;
-        for (Widget w : ordered)
+        if (debug)
         {
-            if (count >= 6) break;
-            String raw = w.getText();
-            String plain = stripTags(raw).trim();
-            if (plain.isEmpty()) continue;
-            if (sb.length() > 0) sb.append("\n");
-            sb.append(plain);
-            count++;
+            if (result.isEmpty()) log.debug("[Collector] no relevant widgets found for script={}", scriptId);
+            else log.info("[Collector] picked {} widgets for script={}", result.size(), scriptId);
         }
-        return sb.toString();
+
+        return result;
     }
 
-    /** When options are visible, return only the container to avoid per-row id collisions */
-    public List<Widget> getRelevantWidgetsAsList(boolean optionsVisible)
+    private boolean isBlacklisted(int widgetId)
     {
-        if (optionsVisible)
-        {
-            Widget container = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
-            if (container != null && !container.isHidden())
-            {
-                if (debug)
-                {
-                    Rectangle b = container.getBounds();
-                    log.info("getRelevant: options container only id={} bounds={}",
-                            container.getId(), (b == null ? "null" : (b.x + "," + b.y + " " + b.width + "x" + b.height)));
-                }
-                List<Widget> single = new ArrayList<>(1);
-                single.add(container);
-                return single;
-            }
-        }
-        return getRelevantWidgetsAsList();
+        return widgetId == WidgetInfo.DIALOG_PLAYER.getId();
     }
 
-    public List<Widget> getRelevantWidgetsAsList()
+    /* ========= Collectors ========= */
+
+    private void collectChatbox(Map<String, CollectedWidget> map)
     {
-        LinkedHashMap<Integer, Widget> byId = new LinkedHashMap<>();
-
-        java.util.function.Consumer<Widget> addIfVisible = w -> {
-            if (w != null && !w.isHidden())
-            {
-                byId.put(w.getId(), w);
-            }
-        };
-
-        // Chatbox container 162:566 deep scan
-        Widget chatboxContainer = client.getWidget(162, 566);
-        if (chatboxContainer != null && !chatboxContainer.isHidden())
+        Widget chatboxContainer = client.getWidget(162, 36);
+        if (chatboxContainer == null || chatboxContainer.isHidden())
         {
-            List<Widget> texts = collectDescendantTextWidgets(chatboxContainer, 200);
-            if (!texts.isEmpty())
-            {
-                texts.sort((a, b) -> {
-                    Rectangle ra = a.getBounds(), rb = b.getBounds();
-                    int ay = ra == null ? Integer.MAX_VALUE : ra.y;
-                    int by = rb == null ? Integer.MAX_VALUE : rb.y;
-                    if (ay != by) return Integer.compare(ay, by);
-                    int ax = ra == null ? Integer.MAX_VALUE : ra.x;
-                    int bx = rb == null ? Integer.MAX_VALUE : rb.x;
-                    return Integer.compare(ax, bx);
-                });
-                for (Widget w : texts) byId.put(w.getId(), w);
-
-                if (debug)
-                {
-                    log.info("Chatbox scan: picked {} text widgets under 162:566", texts.size());
-                    for (Widget w : texts)
-                    {
-                        Rectangle b = w.getBounds();
-                        String raw = w.getText();
-                        log.info("  cbx id={} grp={} child={} len={} bounds={}",
-                                w.getId(), (w.getId() >>> 16), (w.getId() & 0xFFFF),
-                                raw == null ? -1 : stripTags(raw).trim().length(),
-                                (b == null ? "null" : (b.x + "," + b.y + " " + b.width + "x" + b.height)));
-                    }
-                }
-                return new ArrayList<>(byId.values());
-            }
-            else if (debug)
-            {
-                log.info("Chatbox scan: 162:566 visible but found no text widgets");
-            }
+            if (debug) log.trace("Chatbox container not found or hidden");
+            return;
         }
 
-        // Dialogue options (if visible)
-        Widget dialogOptions = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
-        if (dialogOptions != null && !dialogOptions.isHidden())
+        List<Widget> texts = collectDescendantTextWidgets(chatboxContainer, 200);
+        texts.sort(WIDGET_BOUNDS_COMPARATOR);
+
+        for (Widget w : texts)
         {
-            Widget[] rows = dialogOptions.getDynamicChildren();
-            if (rows == null || rows.length == 0) rows = dialogOptions.getChildren();
-            if (rows == null || rows.length == 0) rows = dialogOptions.getStaticChildren();
+            String plain = toPlainText(w);
+            if (plain == null || plain.trim().isEmpty()) continue;
 
-            if (rows != null)
+            GlossaryService.Type guess = classifyWidget(w, plain);
+            String key = uniqueKey(w, plain);
+
+            map.put(key, new CollectedWidget(w, guess, plain));
+            if (debug)
             {
-                List<Widget> ordered = new ArrayList<>(rows.length);
-                for (Widget r : rows) if (r != null && !r.isHidden()) ordered.add(r);
-                ordered.sort((a, b) -> {
-                    Rectangle ra = a.getBounds(), rb = b.getBounds();
-                    int ay = ra == null ? Integer.MAX_VALUE : ra.y;
-                    int by = rb == null ? Integer.MAX_VALUE : rb.y;
-                    if (ay != by) return Integer.compare(ay, by);
-                    int ax = ra == null ? Integer.MAX_VALUE : ra.x;
-                    int bx = rb == null ? Integer.MAX_VALUE : rb.x;
-                    return Integer.compare(ax, bx);
-                });
-
-                int count = 0;
-                for (Widget opt : ordered)
-                {
-                    String t = opt.getText();
-                    if (t == null || stripTags(t).trim().isEmpty()) continue;
-                    byId.put(opt.getId(), opt);
-                    count++;
-                    if (count >= 6) break;
-                }
-                if (debug) log.info("Options: picked {} row widgets", count);
+                log.debug("[Collector][CHATBOX] collected id={} bounds={} plain='{}' type={}",
+                        w.getId(), w.getBounds(), truncate(plain), guess);
             }
-            return new ArrayList<>(byId.values());
         }
-
-        // Normal dialogue detection
-        addIfVisible.accept(client.getWidget(231, 4));    // ChatLeft.Name
-        addIfVisible.accept(client.getWidget(231, 6));    // ChatLeft.Text
-        addIfVisible.accept(client.getWidget(231, 5));    // ChatLeft.Continue
-
-        addIfVisible.accept(client.getWidget(217, 4));    // ChatRight.Name
-        addIfVisible.accept(client.getWidget(217, 6));    // ChatRight.Text
-        addIfVisible.accept(client.getWidget(217, 5));    // ChatRight.Continue
-
-        addIfVisible.accept(client.getWidget(WidgetInfo.DIALOG_NPC_TEXT));
-        addIfVisible.accept(client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT));
-
-        return new ArrayList<>(byId.values());
     }
 
-    /** Collect visible, text-like widgets under a container (BFS), skipping sprites/icons. */
+    private void collectOptions(Map<String, CollectedWidget> map)
+    {
+        Widget optContainer = client.getWidget(WidgetInfo.DIALOG_OPTION_OPTIONS);
+        if (optContainer == null || optContainer.isHidden()) return;
+
+        Widget[] rows = optContainer.getDynamicChildren();
+        if (rows == null || rows.length == 0) rows = optContainer.getChildren();
+        if (rows == null) return;
+
+        for (Widget row : rows)
+        {
+            if (row == null || row.isHidden()) continue;
+            String plain = toPlainText(row);
+            if (plain == null || plain.trim().isEmpty()) continue;
+
+            String key = uniqueKey(row, plain);
+            map.put(key, new CollectedWidget(row, GlossaryService.Type.ACTION, plain));
+
+            if (debug) log.debug("[Collector][OPTIONS] row id={} plain='{}'", row.getId(), truncate(plain));
+        }
+    }
+
+    private void collectFallbackDialogue(Map<String, CollectedWidget> map)
+    {
+        addIfVisible(map, client.getWidget(231, 4), GlossaryService.Type.NPC);
+        addIfVisible(map, client.getWidget(231, 6), GlossaryService.Type.DIALOG);
+        addIfVisible(map, client.getWidget(231, 5), GlossaryService.Type.UI);
+
+        addIfVisible(map, client.getWidget(217, 4), GlossaryService.Type.NPC);
+        addIfVisible(map, client.getWidget(217, 6), GlossaryService.Type.DIALOG);
+        addIfVisible(map, client.getWidget(217, 5), GlossaryService.Type.UI);
+
+        addIfVisible(map, client.getWidget(WidgetInfo.DIALOG_NPC_TEXT), GlossaryService.Type.DIALOG);
+        addIfVisible(map, client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT), GlossaryService.Type.DIALOG);
+
+        Widget playerName = client.getWidget(WidgetInfo.DIALOG_PLAYER);
+        if (playerName != null && !playerName.isHidden() && debug)
+        {
+            log.debug("Skipping player name widget id={} plain='{}'",
+                    playerName.getId(), truncate(toPlainText(playerName)));
+        }
+    }
+
+    /* ========= Utilities ========= */
+
     public List<Widget> collectDescendantTextWidgets(Widget root, int limit)
     {
         List<Widget> out = new ArrayList<>();
@@ -195,19 +189,14 @@ public class WidgetCollector
             Widget cur = q.poll();
             if (cur == null || cur.isHidden()) continue;
 
-            Widget[] dyn = cur.getDynamicChildren();
-            Widget[] ch  = cur.getChildren();
-            Widget[] st  = cur.getStaticChildren();
-            if (dyn != null) for (Widget w : dyn) if (w != null) q.add(w);
-            if (ch  != null) for (Widget w : ch)  if (w != null) q.add(w);
-            if (st  != null) for (Widget w : st)  if (w != null) q.add(w);
-
+            for (Widget c : getAllChildren(cur))
+            {
+                if (c != null) q.add(c);
+            }
             if (cur == root) continue;
 
-            String raw = cur.getText();
-            if (raw == null) continue;
-            String plain = stripTags(raw).trim();
-            if (plain.isEmpty()) continue;
+            String plain = toPlainText(cur);
+            if (plain == null || plain.trim().isEmpty()) continue;
 
             Rectangle b = cur.getBounds();
             if (b == null || b.width <= 0 || b.height <= 0) continue;
@@ -215,5 +204,22 @@ public class WidgetCollector
             out.add(cur);
         }
         return out;
+    }
+
+    private void addIfVisible(Map<String, CollectedWidget> map, Widget w, GlossaryService.Type type)
+    {
+        if (w == null || w.isHidden()) return;
+
+        String plain = toPlainText(w);
+        if (plain == null || plain.trim().isEmpty()) return;
+
+        String key = uniqueKey(w, plain);
+        map.put(key, new CollectedWidget(w, type, plain));
+    }
+
+    /* ========= Stable unique key ========= */
+    private String uniqueKey(Widget w, String plain)
+    {
+        return w.getId() + ":" + System.identityHashCode(w) + ":" + plain.hashCode();
     }
 }

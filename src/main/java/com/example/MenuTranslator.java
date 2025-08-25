@@ -9,6 +9,8 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Translates MenuEntry option (action, white) and target (entity, colored).
@@ -23,8 +25,11 @@ public class MenuTranslator
     private final DeepLTranslator deepL;
     private final AITranslatorConfig config;
 
-    // Simple cache to avoid spamming DeepL for identical phrases
     private final ConcurrentHashMap<String, String> deeplCache = new ConcurrentHashMap<>();
+
+    private static final Pattern COLOR_PATTERN = Pattern.compile("(<col=[0-9a-fA-F]+>.*?</col>)");
+    private static final Pattern COLOR_OR_TAG_PATTERN = Pattern.compile("(<col=[0-9a-fA-F]+>|</col>)");
+    private static final Pattern LEVEL_TAG_PATTERN = Pattern.compile("\\(([^)]+)\\)");
 
     public MenuEntry translate(MenuEntry entry)
     {
@@ -59,6 +64,16 @@ public class MenuTranslator
         if (type == null) return GlossaryService.Type.DEFAULT;
         switch (type)
         {
+            case PLAYER_FIRST_OPTION:
+            case PLAYER_SECOND_OPTION:
+            case PLAYER_THIRD_OPTION:
+            case PLAYER_FOURTH_OPTION:
+            case PLAYER_FIFTH_OPTION:
+            case PLAYER_SIXTH_OPTION:
+            case PLAYER_SEVENTH_OPTION:
+            case PLAYER_EIGHTH_OPTION:
+            case RUNELITE_PLAYER:
+                return GlossaryService.Type.PLAYER;
             case NPC_FIRST_OPTION:
             case NPC_SECOND_OPTION:
             case NPC_THIRD_OPTION:
@@ -100,32 +115,99 @@ public class MenuTranslator
     private String translateAction(String option)
     {
         if (option.isEmpty()) return option;
-
-        String g = glossary.translate(GlossaryService.Type.ACTION, option);
-        return matchCase(option, g);
+        return translateWithColors(option, GlossaryService.Type.ACTION);
     }
 
     private String translateTarget(String target, GlossaryService.Type type)
     {
         if (target.isEmpty()) return target;
 
-        String leading = "";
-        String trailing = "";
-        String inner = target;
-
-        // If it already has a single <col=xxxxxx>...</col>, unwrap it
-        if (inner.matches("^<col=[0-9a-fA-F]{6}>.*</col>$"))
+        String base;
+        if (target.contains("<col="))
         {
-            int gt = inner.indexOf('>') + 1;
-            leading = inner.substring(0, gt);
-            trailing = "</col>";
-            inner = inner.substring(gt, inner.length() - trailing.length());
+            base = translateWithColors(target, type);
+        }
+        else
+        {
+            base = tokenizeAndTranslate(target, type);
         }
 
-        String g = glossary.translate(type, inner);
-        g = matchCase(inner, g);
+        // Finally, translate structured tags like (level-18), (rating-2000), etc.
+        return translateLevelTags(base);
+    }
 
-        return leading + g + trailing;
+    /**
+     * Handles strings with multiple <col=xxxxxx> ... </col> segments.
+     * Outer text → provided type, inner <col> segments → DEFAULT.
+     */
+    private String translateWithColors(String text, GlossaryService.Type outerType)
+    {
+        StringBuilder sb = new StringBuilder();
+        Matcher matcher = COLOR_OR_TAG_PATTERN.matcher(text);
+
+        int last = 0;
+        GlossaryService.Type currentType = outerType;
+
+        while (matcher.find())
+        {
+            // Text before the tag
+            if (matcher.start() > last)
+            {
+                String before = text.substring(last, matcher.start());
+                sb.append(tokenizeAndTranslate(before, currentType));
+            }
+
+            String tag = matcher.group(1);
+            sb.append(tag);
+
+            if (tag.startsWith("<col="))
+            {
+                currentType = GlossaryService.Type.DEFAULT; // switch inside colored text
+            }
+            else if ("</col>".equals(tag))
+            {
+                currentType = outerType; // reset after closing
+            }
+
+            last = matcher.end();
+        }
+
+        // Remaining text after last tag
+        if (last < text.length())
+        {
+            String after = text.substring(last);
+            sb.append(tokenizeAndTranslate(after, currentType));
+        }
+
+        return sb.toString();
+    }
+
+    private String translatePlain(String text, GlossaryService.Type type)
+    {
+        if (text == null || text.isEmpty()) return text;
+
+        StringBuilder sb = new StringBuilder();
+        Matcher m = Pattern.compile("[A-Za-z]+|\\d+|[^A-Za-z\\d]+").matcher(text);
+
+        while (m.find())
+        {
+            String token = m.group();
+            if (token.matches("[A-Za-z]+")) // word
+            {
+                String g = glossary.translate(type, token);
+                if (equalsIgnoreCaseTrim(g, token))
+                {
+                    g = glossary.translate(GlossaryService.Type.DEFAULT, token);
+                }
+                sb.append(matchCase(token, g));
+            }
+            else
+            {
+                sb.append(token);
+            }
+        }
+
+        return sb.toString();
     }
 
     private void triggerAsyncDeepL(String src, GlossaryService.Type type, java.util.function.Consumer<String> store)
@@ -135,7 +217,6 @@ public class MenuTranslator
             final String lang = safeLang(config.targetLang());
             if (lang.isEmpty()) return;
 
-            // Map GlossaryService.Type to GlossaryService.Type
             GlossaryService.Type glossaryType;
             switch (type)
             {
@@ -160,7 +241,6 @@ public class MenuTranslator
         }
         catch (Exception ex)
         {
-            // never let translation break menu building
             log.debug("DeepL trigger failed: {}", ex.toString());
         }
     }
@@ -222,5 +302,59 @@ public class MenuTranslator
         log.debug("translateOptionOnly: '{}' -> '{}'", option, translated);
 
         return translated;
+    }
+
+    private String tokenizeAndTranslate(String text, GlossaryService.Type type)
+    {
+        if (text == null || text.isEmpty()) return text;
+
+        StringBuilder sb = new StringBuilder();
+        Matcher m = Pattern.compile("[A-Za-z]+|\\d+|[^A-Za-z\\d]+").matcher(text);
+        while (m.find())
+        {
+            String token = m.group();
+            if (token.matches("[A-Za-z]+"))
+            {
+                String translated = glossary.translate(type, token);
+                if (equalsIgnoreCaseTrim(translated, token))
+                {
+                    translated = glossary.translate(GlossaryService.Type.DEFAULT, token);
+                }
+                sb.append(matchCase(token, translated));
+            }
+            else
+            {
+                sb.append(token);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Detects and translates structured tags like (level-18), (rating-2000) without
+     * touching player names or other outer text.
+     */
+    private String translateLevelTags(String text)
+    {
+        Matcher matcher = LEVEL_TAG_PATTERN.matcher(text);
+        StringBuffer sb = new StringBuffer();
+        while (matcher.find())
+        {
+            String inner = matcher.group(1); // e.g. "level-18"
+            String[] parts = inner.split("-", 2);
+            if (parts.length > 0)
+            {
+                String keyword = parts[0].trim(); // "level"
+                String rest = parts.length > 1 ? "-" + parts[1] : "";
+                String translatedKeyword = glossary.translate(GlossaryService.Type.DEFAULT, keyword);
+                matcher.appendReplacement(sb, "(" + translatedKeyword + rest + ")");
+            }
+            else
+            {
+                matcher.appendReplacement(sb, matcher.group());
+            }
+        }
+        matcher.appendTail(sb);
+        return sb.toString();
     }
 }

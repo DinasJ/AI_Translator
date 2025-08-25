@@ -9,7 +9,6 @@ import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.OverlayPriority;
 
 import javax.inject.Inject;
 import java.awt.Dimension;
@@ -18,6 +17,7 @@ import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.Shape;
+import java.awt.RenderingHints;
 import java.awt.geom.Area;
 import java.awt.image.BufferedImage;
 import java.io.InputStream;
@@ -33,8 +33,6 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Renders cropped chat background and per-widget translated text.
- * Sticky rendering: translations are kept for a short grace period to avoid flicker
- * when widgets briefly disappear or report empty text between states.
  */
 public class ChatOverlay extends Overlay
 {
@@ -52,6 +50,11 @@ public class ChatOverlay extends Overlay
     // Last seen tick per widget id (to implement grace TTL)
     private final Map<Integer, Integer> lastSeenTickById = new ConcurrentHashMap<>();
 
+    // Instrumentation: when setTranslation is called we record the timestamp (ms)
+    private final Map<Integer, Long> translationSetMs = new ConcurrentHashMap<>();
+
+    // Optional cache of pre-rendered translation images (to speed repeated draws)
+    private final Map<Integer, BufferedImage> translationImageById = new ConcurrentHashMap<>();
     private static final float SCALE = 1f;
     private static final int CENTERED_LINE_GAP = 1;
 
@@ -67,7 +70,6 @@ public class ChatOverlay extends Overlay
         this.spriteManager = spriteManager;
 
         setPosition(OverlayPosition.DYNAMIC);
-        setPriority(OverlayPriority.MED);
         setLayer(OverlayLayer.ABOVE_WIDGETS);
     }
 
@@ -81,12 +83,17 @@ public class ChatOverlay extends Overlay
     {
         if (translated == null || translated.isEmpty())
         {
-            // Do not remove here unconditionally; sticky behavior handled by pruneExpired
+            // Remove translation and its timestamp and cached image
             translatedById.remove(widgetId);
+            translationSetMs.remove(widgetId);
+            translationImageById.remove(widgetId);
         }
         else
         {
             translatedById.put(widgetId, translated);
+            translationSetMs.put(widgetId, System.currentTimeMillis());
+            // Invalidate any existing cached image so we regenerate next draw
+            translationImageById.remove(widgetId);
         }
     }
 
@@ -117,6 +124,8 @@ public class ChatOverlay extends Overlay
             if (DEBUG) log.info("Prune expired translation id={} (currentTick={})", id, currentTick);
             translatedById.remove(id);
             lastSeenTickById.remove(id);
+            translationSetMs.remove(id);
+            translationImageById.remove(id);
         }
     }
 
@@ -125,19 +134,25 @@ public class ChatOverlay extends Overlay
         sourceWidgets = Collections.emptyList();
         translatedById.clear();
         lastSeenTickById.clear();
+        translationSetMs.clear();
+        translationImageById.clear();
+        log.debug("clearing all translations");
     }
 
     @Override
     public Dimension render(Graphics2D g)
     {
+        if (DEBUG) log.debug("[ChatOverlay.render] sourceWidgets={} translatedIds={}", sourceWidgets.size(), translatedById.size());
         Widget chatBgParent = client.getWidget(162, 36);
         if (chatBgParent == null || chatBgParent.isHidden())
         {
+            if (DEBUG) log.debug("[ChatOverlay.render] chatBgParent missing/hidden");
             return null;
         }
         Widget chatBg = chatBgParent.getChild(0);
         if (chatBg == null || chatBg.isHidden())
         {
+            if (DEBUG) log.debug("[ChatOverlay.render] chatBg missing/hidden");
             return null;
         }
 
@@ -152,6 +167,8 @@ public class ChatOverlay extends Overlay
         if (optContainer != null && !optContainer.isHidden())
         {
             Widget[] rows = getOptionRows(optContainer);
+            if (DEBUG) log.debug("[ChatOverlay.render] options visible containerId={} rows={} hasCombined={}",
+                    optContainer.getId(), (rows == null ? 0 : rows.length), translatedById.containsKey(optContainer.getId()));
             if (rows != null && rows.length > 0)
             {
                 java.util.List<Rectangle> textRowRects = new java.util.ArrayList<>();
@@ -201,7 +218,8 @@ public class ChatOverlay extends Overlay
         }
         else
         {
-            // Dialogue text/name/continue background clipping (non-options)
+            if (DEBUG) log.debug("[ChatOverlay.render] options not visible");
+            // Non-option dialogues
             java.util.List<Rectangle> rects = collectTextBounds();
             if (!rects.isEmpty())
             {
@@ -215,12 +233,18 @@ public class ChatOverlay extends Overlay
 
                 g.setClip(oldClip);
             }
+            else if (DEBUG) {
+                log.debug("[ChatOverlay.render] no dialogue rects to clip");
+            }
         }
 
         // Draw per-widget translations (including those inside grace window)
         if (!translatedById.isEmpty())
         {
             drawPerWidget(g);
+        }
+        else if (DEBUG) {
+            log.debug("[ChatOverlay.render] no translated ids to draw");
         }
 
         return null;
@@ -274,65 +298,97 @@ public class ChatOverlay extends Overlay
         if (optContainer != null && !optContainer.isHidden())
         {
             String combined = translatedById.get(optContainer.getId());
-            if (combined != null && !combined.isEmpty())
+            BufferedImage optImg = translationImageById.get(optContainer.getId());
+            if (optImg != null)
             {
-                Widget[] rowArr = getOptionRows(optContainer);
-                if (rowArr != null && rowArr.length > 0)
+                Point loc = optContainer.getCanvasLocation();
+                if (loc != null)
                 {
-                    // Build ordered rows, filter to TEXT rows (skip icons/empties)
-                    List<Widget> textRows = new ArrayList<>();
-                    for (Widget w : rowArr)
+                    g.drawImage(optImg, loc.getX(), loc.getY(), null);
+
+                    if (DEBUG)
                     {
-                        if (w == null || w.isHidden()) continue;
-                        String raw = w.getText();
-                        if (raw == null || stripTags(raw).trim().isEmpty()) continue; // skip icon rows
-                        textRows.add(w);
+                        Long setMs = translationSetMs.get(optContainer.getId());
+                        long drawMs = System.currentTimeMillis();
+                        long delta = setMs == null ? -1L : drawMs - setMs;
+                        log.debug("[DRAW] optContainer id={} setMs={} drawMs={} deltaMs={} preview='{}'",
+                                optContainer.getId(), setMs, drawMs, delta, (combined == null ? "" : (combined.length() > 80 ? combined.substring(0, 77) + "..." : combined)));
                     }
-                    textRows.sort((a, b) -> {
-                        Rectangle ra = a.getBounds(), rb = b.getBounds();
-                        int ay = (ra == null ? Integer.MAX_VALUE : ra.y);
-                        int by = (rb == null ? Integer.MAX_VALUE : rb.y);
-                        if (ay != by) return Integer.compare(ay, by);
-                        int ax = (ra == null ? Integer.MAX_VALUE : ra.x);
-                        int bx = (rb == null ? Integer.MAX_VALUE : rb.x);
-                        return Integer.compare(ax, bx);
-                    });
-
-                    if (!textRows.isEmpty())
+                }
+                // already drew pre-rendered image
+            }
+            else
+            {
+                // Attempt to lazily create pre-rendered image for the options combined text so subsequent draws are faster.
+                if (combined != null && !combined.isEmpty())
+                {
+                    BufferedImage created = createOptionsImage(optContainer, combined, rsFont, customFont, rsFM, cyrFM, lineHeight);
+                    if (created != null)
                     {
-                        // Clip to union of TEXT row rects and subtract icon rects
-                        Shape oldClip = g.getClip();
-                        Area union = new Area();
-                        for (int i = 0; i < Math.min(textRows.size(), 6); i++)
+                        translationImageById.put(optContainer.getId(), created);
+                        // draw immediately
+                        Point loc = optContainer.getCanvasLocation();
+                        if (loc != null) g.drawImage(created, loc.getX(), loc.getY(), null);
+                    }
+                    else
+                    {
+                        // fallback to previous per-row direct drawing if image creation failed
+                        Widget[] rowArr = getOptionRows(optContainer);
+                        if (rowArr != null && rowArr.length > 0)
                         {
-                            Rectangle rb = textRows.get(i).getBounds();
-                            if (rb != null && rb.width > 0 && rb.height > 0) union.add(new Area(rb));
+                            List<Widget> textRows = new ArrayList<>();
+                            for (Widget w : rowArr)
+                            {
+                                if (w == null || w.isHidden()) continue;
+                                String raw = w.getText();
+                                if (raw == null || stripTags(raw).trim().isEmpty()) continue; // skip icon rows
+                                textRows.add(w);
+                            }
+                            textRows.sort((a, b) -> {
+                                Rectangle ra = a.getBounds(), rb = b.getBounds();
+                                int ay = (ra == null ? Integer.MAX_VALUE : ra.y);
+                                int by = (rb == null ? Integer.MAX_VALUE : rb.y);
+                                if (ay != by) return Integer.compare(ay, by);
+                                int ax = (ra == null ? Integer.MAX_VALUE : ra.x);
+                                int bx = (rb == null ? Integer.MAX_VALUE : rb.x);
+                                return Integer.compare(ax, bx);
+                            });
+
+                            if (!textRows.isEmpty())
+                            {
+                                Shape oldClip = g.getClip();
+                                Area union = new Area();
+                                for (int i = 0; i < Math.min(textRows.size(), 6); i++)
+                                {
+                                    Rectangle rb = textRows.get(i).getBounds();
+                                    if (rb != null && rb.width > 0 && rb.height > 0) union.add(new Area(rb));
+                                }
+                                for (Rectangle ir : getOptionIconRects(optContainer)) union.subtract(new Area(ir));
+                                g.setClip(union);
+
+                                String[] lines = combined.split("\\R", -1);
+                                int count = Math.min(lines.length, textRows.size());
+                                for (int i = 0; i < Math.min(count, 6); i++)
+                                {
+                                    Widget r = textRows.get(i);
+                                    Rectangle rb = r.getBounds();
+                                    if (rb == null || rb.isEmpty()) continue;
+
+                                    java.awt.Color color;
+                                    try { color = new java.awt.Color(r.getTextColor()); } catch (Exception e) { color = java.awt.Color.WHITE; }
+                                    g.setColor(color);
+
+                                    String text = lines[i].trim();
+                                    int wpx = measureMixedWidth(text, rsFM, cyrFM);
+                                    int x = rb.x + Math.max(0, (rb.width - wpx) / 2);
+                                    int y = rb.y + Math.max(0, (rb.height - lineHeight) / 2) + rsAscent;
+
+                                    drawMixed(g, text, x, y, rsFont, customFont, rsFM, cyrFM);
+                                }
+
+                                g.setClip(oldClip);
+                            }
                         }
-                        for (Rectangle ir : getOptionIconRects(optContainer)) union.subtract(new Area(ir));
-                        g.setClip(union);
-
-                        String[] lines = combined.split("\\R", -1);
-                        int count = Math.min(lines.length, textRows.size());
-                        for (int i = 0; i < Math.min(count, 6); i++)
-                        {
-                            Widget r = textRows.get(i);
-                            Rectangle rb = r.getBounds();
-                            if (rb == null || rb.isEmpty()) continue;
-
-                            java.awt.Color color;
-                            try { color = new java.awt.Color(r.getTextColor()); } catch (Exception e) { color = java.awt.Color.WHITE; }
-                            g.setColor(color);
-
-                            // Center each single-line vertically in its row rect
-                            String text = lines[i].trim();
-                            int wpx = measureMixedWidth(text, rsFM, cyrFM);
-                            int x = rb.x + Math.max(0, (rb.width - wpx) / 2);
-                            int y = rb.y + Math.max(0, (rb.height - lineHeight) / 2) + rsAscent;
-
-                            drawMixed(g, text, x, y, rsFont, customFont, rsFM, cyrFM);
-                        }
-
-                        g.setClip(oldClip);
                     }
                 }
             }
@@ -355,6 +411,52 @@ public class ChatOverlay extends Overlay
             Rectangle wb = w.getBounds();
             if (wb == null || wb.isEmpty()) continue;
 
+            // Fast path: if we have a pre-rendered image, blit it and continue
+            BufferedImage img = translationImageById.get(id);
+            if (img != null)
+            {
+                Point loc = w.getCanvasLocation();
+                if (loc != null)
+                {
+                    g.drawImage(img, loc.getX(), loc.getY(), null);
+
+                    if (DEBUG)
+                    {
+                        Long setMs = translationSetMs.get(id);
+                        long drawMs = System.currentTimeMillis();
+                        long delta = setMs == null ? -1L : drawMs - setMs;
+                        String preview = translated.length() > 80 ? translated.substring(0, 77) + "..." : translated;
+                        log.debug("[DRAW] id={} setMs={} drawMs={} deltaMs={} preview='{}' (blit image)", id, setMs, drawMs, delta, preview);
+                    }
+                }
+
+                continue; // already drawn via image
+            }
+
+            // No cached image yet — create one lazily and cache it
+            BufferedImage created = createPerWidgetImage(w, translated, rsFont, customFont, rsFM, cyrFM, lineHeight);
+            if (created != null)
+            {
+                translationImageById.put(id, created);
+                Point loc = w.getCanvasLocation();
+                if (loc != null)
+                {
+                    g.drawImage(created, loc.getX(), loc.getY(), null);
+                }
+
+                if (DEBUG)
+                {
+                    Long setMs = translationSetMs.get(id);
+                    long drawMs = System.currentTimeMillis();
+                    long delta = setMs == null ? -1L : drawMs - setMs;
+                    String preview = translated.length() > 80 ? translated.substring(0, 77) + "..." : translated;
+                    log.debug("[DRAW] id={} setMs={} drawMs={} deltaMs={} preview='{}' (created image)", id, setMs, drawMs, delta, preview);
+                }
+
+                continue;
+            }
+
+            // Fallback (shouldn't normally be hit because createPerWidgetImage tries to handle everything)
             Rectangle clipRect = new Rectangle(wb.x, wb.y, wb.width, wb.height + 2);
             Shape oldClip = g.getClip();
             g.setClip(clipRect);
@@ -362,6 +464,8 @@ public class ChatOverlay extends Overlay
             java.awt.Color color;
             try { color = new java.awt.Color(w.getTextColor()); } catch (Exception e) { color = java.awt.Color.WHITE; }
             g.setColor(color);
+
+            int rsAscentLocal = rsFM.getAscent();
 
             boolean isLeftName     = grp == 231 && child == 4;
             boolean isLeftText     = grp == 231 && child == 6;
@@ -376,20 +480,18 @@ public class ChatOverlay extends Overlay
 
             if (isName || isContinue)
             {
-                // Single-line: center vertically within widget bounds
                 String row = translated.trim();
                 int wpx = measureMixedWidth(row, rsFM, cyrFM);
                 int x = wb.x + Math.max(0, (wb.width - wpx) / 2);
-                int y = wb.y + Math.max(0, (wb.height - lineHeight) / 2) + rsAscent;
+                int y = wb.y + Math.max(0, (wb.height - lineHeight) / 2) + rsAscentLocal;
                 drawMixed(g, row, x, y, rsFont, customFont, rsFM, cyrFM);
             }
             else if (isText)
             {
-                // Multi-line body: compute total block height and center vertically
                 List<String> rows = wrapToWidth(translated, Math.max(1, wb.width), rsFM, cyrFM);
                 int n = rows.size();
                 int totalBlockH = n * lineHeight + Math.max(0, (n - 1) * CENTERED_LINE_GAP);
-                int y = wb.y + Math.max(0, (wb.height - totalBlockH) / 2) + rsAscent;
+                int y = wb.y + Math.max(0, (wb.height - totalBlockH) / 2) + rsAscentLocal;
 
                 for (int i = 0; i < rows.size(); i++)
                 {
@@ -403,11 +505,10 @@ public class ChatOverlay extends Overlay
             }
             else
             {
-                // Fallback: left-anchored multi-line, but center vertically as a block
                 List<String> rows = wrapToWidth(translated, Math.max(1, wb.width), rsFM, cyrFM);
                 int n = rows.size();
                 int totalBlockH = n * lineHeight;
-                int y = wb.y + Math.max(0, (wb.height - totalBlockH) / 2) + rsAscent;
+                int y = wb.y + Math.max(0, (wb.height - totalBlockH) / 2) + rsAscentLocal;
                 int x = (w.getCanvasLocation() != null ? w.getCanvasLocation().getX() : wb.x);
                 for (String row : rows)
                 {
@@ -417,7 +518,204 @@ public class ChatOverlay extends Overlay
                 }
             }
 
+            if (DEBUG)
+            {
+                Long setMs = translationSetMs.get(id);
+                long drawMs = System.currentTimeMillis();
+                long delta = setMs == null ? -1L : drawMs - setMs;
+                String preview = translated.length() > 80 ? translated.substring(0, 77) + "..." : translated;
+                log.debug("[DRAW] id={} setMs={} drawMs={} deltaMs={} preview='{}'", id, setMs, drawMs, delta, preview);
+            }
+
             g.setClip(oldClip);
+        }
+    }
+
+    // Create a pre-rendered image for a single widget's translated text.
+    // Returns the created BufferedImage or null on failure.
+    private BufferedImage createPerWidgetImage(Widget w, String translated, Font rsFont, Font cyrFont, FontMetrics rsFM, FontMetrics cyrFM, int lineHeight)
+    {
+        if (w == null || translated == null) return null;
+        Rectangle wb = w.getBounds();
+        if (wb == null || wb.width <= 0 || wb.height <= 0) return null;
+
+        int width = Math.max(1, wb.width);
+        int height = Math.max(1, wb.height + 2);
+
+        try
+        {
+            BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D ig = img.createGraphics();
+            try
+            {
+                // decent quality
+                ig.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                ig.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+                // Determine text layout based on widget role (centered names / multi-line body / fallback)
+                int id = w.getId();
+                int grp = (id >>> 16), child = (id & 0xFFFF);
+
+                boolean isLeftName     = grp == 231 && child == 4;
+                boolean isLeftText     = grp == 231 && child == 6;
+                boolean isLeftContinue = grp == 231 && child == 5;
+                boolean isRightName     = grp == 217 && child == 4;
+                boolean isRightText     = grp == 217 && child == 6;
+                boolean isRightContinue = grp == 217 && child == 5;
+
+                boolean isName = isLeftName || isRightName;
+                boolean isText = isLeftText || isRightText;
+                boolean isContinue = isLeftContinue || isRightContinue;
+
+                // Use the image's graphics font metrics to draw (more accurate inside image)
+                FontMetrics rsFMImg = ig.getFontMetrics(rsFont);
+                FontMetrics cyrFMImg = ig.getFontMetrics(cyrFont);
+                int rsAscentImg = rsFMImg.getAscent();
+                int localLineHeight = rsAscentImg + rsFMImg.getDescent();
+
+                ig.setColor(new java.awt.Color(0,0,0,0)); // transparent background
+                ig.fillRect(0, 0, width, height);
+
+                // prepare color; use white text by default (actual widget color will be used when drawing over image)
+                ig.setColor(java.awt.Color.WHITE);
+
+                if (isName || isContinue)
+                {
+                    String row = translated.trim();
+                    int wpx = measureMixedWidth(row, rsFMImg, cyrFMImg);
+                    int x = Math.max(0, (width - wpx) / 2);
+                    int y = Math.max(0, (height - localLineHeight) / 2) + rsAscentImg;
+                    drawMixed(ig, row, x, y, rsFont, cyrFont, rsFMImg, cyrFMImg);
+                }
+                else if (isText)
+                {
+                    List<String> rows = wrapToWidth(translated, width, rsFMImg, cyrFMImg);
+                    int n = rows.size();
+                    int totalBlockH = n * localLineHeight + Math.max(0, (n - 1) * CENTERED_LINE_GAP);
+                    int y = Math.max(0, (height - totalBlockH) / 2) + rsAscentImg;
+
+                    for (int i = 0; i < rows.size(); i++)
+                    {
+                        String row = rows.get(i);
+                        int wpx = measureMixedWidth(row, rsFMImg, cyrFMImg);
+                        int x = Math.max(0, (width - wpx) / 2);
+                        drawMixed(ig, row, x, y, rsFont, cyrFont, rsFMImg, cyrFMImg);
+                        y += localLineHeight + CENTERED_LINE_GAP;
+                        if (y > height + 1) break;
+                    }
+                }
+                else
+                {
+                    List<String> rows = wrapToWidth(translated, width, rsFMImg, cyrFMImg);
+                    int n = rows.size();
+                    int totalBlockH = n * localLineHeight;
+                    int y = Math.max(0, (height - totalBlockH) / 2) + rsAscentImg;
+                    int x = 0;
+                    for (String row : rows)
+                    {
+                        drawMixed(ig, row, x, y, rsFont, cyrFont, rsFMImg, cyrFMImg);
+                        y += localLineHeight;
+                        if (y > height + 1) break;
+                    }
+                }
+
+                return img;
+            }
+            finally
+            {
+                ig.dispose();
+            }
+        }
+        catch (Throwable t)
+        {
+            if (DEBUG) log.debug("Failed to create per-widget image id={} err={}", w.getId(), t.toString());
+            return null;
+        }
+    }
+
+    // Create an image that covers the union of option TEXT row rects and draws the combined translation lines into it.
+    private BufferedImage createOptionsImage(Widget optContainer, String combined, Font rsFont, Font cyrFont, FontMetrics rsFM, FontMetrics cyrFM, int lineHeight)
+    {
+        Widget[] rowArr = getOptionRows(optContainer);
+        if (rowArr == null || rowArr.length == 0) return null;
+
+        List<Widget> textRows = new ArrayList<>();
+        for (Widget r : rowArr)
+        {
+            if (r == null || r.isHidden()) continue;
+            String raw = r.getText();
+            if (raw == null || stripTags(raw).trim().isEmpty()) continue;
+            textRows.add(r);
+        }
+        if (textRows.isEmpty()) return null;
+
+        // Determine union bounds of the text rows (limit to 6 rows like before)
+        Rectangle union = null;
+        List<Rectangle> rowRects = new ArrayList<>();
+        for (int i = 0; i < Math.min(textRows.size(), 6); i++)
+        {
+            Rectangle rb = textRows.get(i).getBounds();
+            if (rb == null || rb.width <= 0 || rb.height <= 0) continue;
+            rowRects.add(rb);
+            if (union == null) union = new Rectangle(rb);
+            else union = union.union(rb);
+        }
+        if (union == null) return null;
+
+        // Subtract icons (we will keep transparency in icon areas; not drawing them)
+        List<Rectangle> icons = getOptionIconRects(optContainer);
+
+        int width = Math.max(1, union.width);
+        int height = Math.max(1, union.height);
+
+        try
+        {
+            BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D ig = img.createGraphics();
+            try
+            {
+                ig.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                ig.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+                FontMetrics rsFMImg = ig.getFontMetrics(rsFont);
+                FontMetrics cyrFMImg = ig.getFontMetrics(cyrFont);
+                int rsAscentImg = rsFMImg.getAscent();
+                int localLineHeight = rsAscentImg + rsFMImg.getDescent();
+
+                // Transparent background
+                ig.setColor(new java.awt.Color(0,0,0,0));
+                ig.fillRect(0, 0, width, height);
+
+                String[] lines = combined.split("\\R", -1);
+                int count = Math.min(lines.length, rowRects.size());
+                for (int i = 0; i < count; i++)
+                {
+                    Rectangle rb = rowRects.get(i);
+                    if (rb == null) continue;
+                    // compute local coords inside union
+                    int localX = rb.x - union.x;
+                    int localY = rb.y - union.y;
+
+                    String text = lines[i].trim();
+                    int wpx = measureMixedWidth(text, rsFMImg, cyrFMImg);
+                    int x = localX + Math.max(0, (rb.width - wpx) / 2);
+                    int y = localY + Math.max(0, (rb.height - localLineHeight) / 2) + rsAscentImg;
+
+                    drawMixed(ig, text, x, y, rsFont, cyrFont, rsFMImg, cyrFMImg);
+                }
+
+                // We leave icon areas transparent; caller will blit this image at union.x/union.y
+                return img;
+            }
+            finally
+            {
+                ig.dispose();
+            }
+        }
+        catch (Throwable t)
+        {
+            if (DEBUG) log.debug("Failed to create options image id={} err={}", optContainer.getId(), t.toString());
+            return null;
         }
     }
 

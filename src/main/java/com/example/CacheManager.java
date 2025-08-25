@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -28,7 +29,12 @@ public class CacheManager
     private final Map<String, String> cache =
             java.util.Collections.synchronizedMap(new LinkedHashMap<String, String>(1024, 0.75f, true) {
                 @Override protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
-                    return size() > MAX_CACHE_ENTRIES;
+                    boolean evict = size() > MAX_CACHE_ENTRIES;
+                    if (evict)
+                    {
+                        log.debug("[CACHE EVICT] key='{}' value='{}'", eldest.getKey(), eldest.getValue());
+                    }
+                    return evict;
                 }
             });
 
@@ -48,7 +54,23 @@ public class CacheManager
             cacheFile = null;
         }
     }
-
+    public String lookup(String key)
+    {
+        if (key == null || key.isEmpty())
+        {
+            return null;
+        }
+        String result = cache.get(key);
+        if (result != null)
+        {
+            log.debug("[CACHE HIT] key='{}' -> '{}'", key, result);
+        }
+        else
+        {
+            log.debug("[CACHE MISS] key='{}'", key);
+        }
+        return result;
+    }
     public void load()
     {
         if (cacheFile == null) return;
@@ -84,7 +106,7 @@ public class CacheManager
         }
     }
 
-    public void saveIfDirty() { if (dirty) saveNow(); }
+    public void saveIfDirty() { if (dirty) saveNow(); else log.debug("[CACHE] saveIfDirty: not dirty"); }
 
     public void saveNow()
     {
@@ -110,13 +132,30 @@ public class CacheManager
 
     public String get(String key)
     {
-        synchronized (cache) { return cache.get(key); }
+        synchronized (cache)
+        {
+            if (cache.containsKey(key))
+            {
+                String val = cache.get(key);
+                log.debug("[CACHE HIT] key='{}' -> '{}'", key, val);
+                return val;
+            }
+            else
+            {
+                log.debug("[CACHE MISS] key='{}'", key);
+                return null;
+            }
+        }
     }
 
     public void put(String key, String value)
     {
         if (key == null || value == null) return;
-        synchronized (cache) { cache.put(key, value); }
+        synchronized (cache)
+        {
+            cache.put(key, value);
+            log.debug("[CACHE PUT] key='{}' -> '{}'", key, value);
+        }
         dirty = true;
     }
 
@@ -125,7 +164,11 @@ public class CacheManager
         if (combinedPlain == null || combinedTranslated == null) return;
         String[] src = combinedPlain.split("\\R");
         String[] dst = combinedTranslated.split("\\R");
-        if (src.length != dst.length) return;
+        if (src.length != dst.length)
+        {
+            log.debug("[CACHE SEED] skipped, line count mismatch ({} vs {})", src.length, dst.length);
+            return;
+        }
 
         boolean any = false;
         for (int i = 0; i < src.length; i++)
@@ -138,10 +181,23 @@ public class CacheManager
                 if (!t.equals(cache.get(s)))
                 {
                     cache.put(s, t);
+                    log.debug("[CACHE SEED] '{}' -> '{}'", s, t);
                     any = true;
                 }
             }
         }
-        if (any) dirty = true;
+        if (any)
+        {
+            dirty = true;
+            log.debug("[CACHE SEED] completed with {} new entries", src.length);
+        }
+    }
+
+    public Map<String, String> getCacheSnapshot()
+    {
+        synchronized (cache)
+        {
+            return new HashMap<>(cache);
+        }
     }
 }

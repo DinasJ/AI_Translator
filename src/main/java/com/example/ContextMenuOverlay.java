@@ -17,7 +17,6 @@ import java.awt.*;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.regex.Pattern;
 
 @Slf4j
 public class ContextMenuOverlay extends Overlay
@@ -42,6 +41,7 @@ public class ContextMenuOverlay extends Overlay
     private volatile MenuEntry[] lastEntries = new MenuEntry[0];
     private volatile List<String> preparedLines = java.util.Collections.emptyList();
     private volatile List<List<TextRun>> preparedRuns = java.util.Collections.emptyList();
+    private volatile List<GlossaryService.Type> preparedTypes = java.util.Collections.emptyList();
     private volatile boolean menuOpen = false;
 
     @Inject
@@ -134,23 +134,34 @@ public class ContextMenuOverlay extends Overlay
         for (int line = 0; line < preparedRuns.size(); line++)
         {
             List<TextRun> runs = preparedRuns.get(line);
-            int lineY = baseY + line * ROW_HEIGHT;
-            int cxLine = x + PADDING_X;
+            GlossaryService.Type type = preparedTypes.get(line);
 
+            int lineY = baseY + line * ROW_HEIGHT;
+            int cx = x + PADDING_X;
             boolean hovered = (line == hoveredIndex);
-            int cx = cxLine;
 
             // Shadow
             String shadowLine = runs.stream().map(r -> r.text).reduce("", String::concat);
             if (!shadowLine.isEmpty())
             {
                 g.setColor(Color.BLACK);
-                g.drawString(shadowLine, cxLine + 1, lineY + 1);
+                g.drawString(shadowLine, cx + 1, lineY + 1);
             }
 
-            for (TextRun run : runs)
+            for (int r = 0; r < runs.size(); r++)
             {
-                g.setColor(hovered ? HOVER_YELLOW : run.color);
+                TextRun run = runs.get(r);
+
+                // Only recolor the FIRST run (the Action) when hovered and type==ACTION
+                if (hovered && type == GlossaryService.Type.ACTION && r == 0)
+                {
+                    g.setColor(HOVER_YELLOW);
+                }
+                else
+                {
+                    g.setColor(run.color);
+                }
+
                 g.drawString(run.text, cx, lineY);
                 cx += fm.stringWidth(run.text);
             }
@@ -206,6 +217,8 @@ public class ContextMenuOverlay extends Overlay
     {
         List<String> lines = new ArrayList<>();
         List<List<TextRun>> runsList = new ArrayList<>();
+        List<GlossaryService.Type> typesList = new ArrayList<>();
+
         if (entries != null && entries.length > 0)
         {
             for (int line = 0; line < entries.length; line++)
@@ -224,6 +237,7 @@ public class ContextMenuOverlay extends Overlay
 
                 lines.add(composedLine);
                 runsList.add(parseTaggedRuns(composedLine, Color.WHITE));
+                typesList.add(GlossaryService.Type.ACTION);
 
                 log.debug("[MenuEntry] idx={} type={} option='{}' target='{}' -> type={}, line='{}'",
                         idx, e.getType(), actionRaw, targetRaw, targetType, composedLine);
@@ -231,6 +245,7 @@ public class ContextMenuOverlay extends Overlay
         }
         preparedLines = lines;
         preparedRuns = runsList;
+        preparedTypes = typesList;
     }
 
     @Subscribe
@@ -283,9 +298,6 @@ public class ContextMenuOverlay extends Overlay
             menuOpen = false;
         }
     }
-
-    private static final Pattern COL_OPEN_OR_CLOSE =
-            Pattern.compile("(?i)<col=([0-9a-f]{6})>|</col>");
 
     private static class TextRun
     {
@@ -387,6 +399,18 @@ public class ContextMenuOverlay extends Overlay
     {
         switch (e.getType())
         {
+            // Player actions
+            case PLAYER_FIRST_OPTION:
+            case PLAYER_SECOND_OPTION:
+            case PLAYER_THIRD_OPTION:
+            case PLAYER_FOURTH_OPTION:
+            case PLAYER_FIFTH_OPTION:
+            case PLAYER_SIXTH_OPTION:
+            case PLAYER_SEVENTH_OPTION:
+            case PLAYER_EIGHTH_OPTION:
+            case RUNELITE_PLAYER:
+                return GlossaryService.Type.PLAYER;
+
             // NPC actions
             case NPC_FIRST_OPTION: case NPC_SECOND_OPTION:
             case NPC_THIRD_OPTION: case NPC_FOURTH_OPTION:
@@ -407,6 +431,13 @@ public class ContextMenuOverlay extends Overlay
             case GAME_OBJECT_FIFTH_OPTION:
             case EXAMINE_OBJECT:
                 return GlossaryService.Type.OBJECT;
+
+            // Ground items
+            case GROUND_ITEM_FIRST_OPTION: case GROUND_ITEM_SECOND_OPTION:
+            case GROUND_ITEM_THIRD_OPTION: case GROUND_ITEM_FOURTH_OPTION:
+            case GROUND_ITEM_FIFTH_OPTION:
+            case EXAMINE_ITEM_GROUND:
+                return GlossaryService.Type.ITEM;
 
             default:
                 return GlossaryService.Type.ACTION;

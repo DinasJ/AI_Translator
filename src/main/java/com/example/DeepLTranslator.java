@@ -15,7 +15,7 @@ import java.util.function.Consumer;
 
 /**
  * A service for asynchronous translation using the DeepL API.
- * Checks glossary first, falls back to DeepL API if needed.
+ * Always checks glossary first, then falls back to DeepL if available.
  */
 @Singleton
 public class DeepLTranslator
@@ -26,12 +26,13 @@ public class DeepLTranslator
     private final OkHttpClient client = new OkHttpClient();
     private final AITranslatorConfig config;
     private final GlossaryService glossaryService;
+    private final CacheManager cacheManager;  // <-- add this
 
     @Inject
-    public DeepLTranslator(AITranslatorConfig config, GlossaryService glossaryService)
-    {
+    public DeepLTranslator(AITranslatorConfig config, GlossaryService glossaryService, CacheManager cacheManager) {
         this.config = config;
         this.glossaryService = glossaryService;
+        this.cacheManager = cacheManager;
     }
 
     /**
@@ -50,16 +51,26 @@ public class DeepLTranslator
             return;
         }
 
-        // ✅ Glossary first
-        String manual = glossaryService.translate(glossaryType, text);
-        if (manual != null && !manual.isEmpty())
+        // --- 1. Cache lookup first (instant, snappy) ---
+        String cached = cacheManager.get(text);
+        if (cached != null && !cached.isEmpty())
         {
-            log.debug("[DeepL] Local glossary hit ({}): '{}' -> '{}'", glossaryType, text, manual);
-            callback.accept(matchCase(text, manual));
+            log.debug("[DeepL] Cache hit ({}): '{}' -> '{}'", glossaryType, text, cached);
+            callback.accept(matchCase(text, cached)); // immediately return
             return;
         }
 
-        // ✅ Ensure API key exists
+        // --- 2. Glossary lookup ---
+        String manual = glossaryService.tryTranslate(glossaryType, text);
+        if (manual != null && !manual.isEmpty())
+        {
+            log.debug("[DeepL] Local glossary hit ({}): '{}' -> '{}'", glossaryType, text, manual);
+            cacheManager.put(text, manual); // seed into cache for future instant hits
+            callback.accept(matchCase(text, manual)); // immediately return
+            return;
+        }
+
+        // --- 3. DeepL fallback (async) ---
         String apiKey = config.deeplApiKey();
         if (apiKey == null || apiKey.isEmpty())
         {
@@ -124,6 +135,10 @@ public class DeepLTranslator
                             .get("text").getAsString();
 
                     log.debug("[DeepL] '{}' -> '{}'", text, translated);
+
+                    // seed cache for instant future hits
+                    cacheManager.put(text, translated);
+
                     safeAccept(callback, matchCase(text, translated));
                 }
                 catch (Exception e)

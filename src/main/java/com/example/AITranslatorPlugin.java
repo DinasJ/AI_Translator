@@ -1,18 +1,21 @@
 package com.example;
 
 import com.google.inject.Provides;
-
 import javax.inject.Inject;
+import javax.inject.Named;
 import javax.inject.Singleton;
-import java.util.Map;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import net.runelite.api.Client;
 import net.runelite.api.events.ClientTick;
-import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -24,80 +27,137 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * AITranslatorPlugin — patched final for GE widget mutation test.
- * - Annotates GE results by appending a small gray Russian name if available in ruIndex.
- * - Safe: all widget reads/writes happen on the client thread and the annotation is throttled.
- * - Restores original texts on shutdown.
- * Notes:
- *  - This is an exploratory convenience tool. The game/client may overwrite widget text
- *    at any time; we re-apply annotations on GE script callbacks and when the GE widgets load.
- *  - If you want to try setting widget itemId or injecting menu entries, that can be added later.
+ * AITranslatorPlugin — main entry point.
+ *
+ * This variant uses @Provides to construct several supporting managers so they can be injected.
  */
 @PluginDescriptor(
         name = "AI Translator",
         description = "Russian translations",
         enabledByDefault = false
 )
-public class AITranslatorPlugin extends Plugin
-{
+public class AITranslatorPlugin extends Plugin {
     private static final Logger log = LoggerFactory.getLogger(AITranslatorPlugin.class);
     private static final boolean DEBUG = true;
     private static final long SAVE_PERIOD_SECONDS = 30;
+    private final Map<Integer, Long> lastScriptAtMs = new HashMap<>();
+    private static final long SCRIPT_DEDUPE_MS = 50L; // ignore duplicates within 50ms
 
-    @Inject private Client client;
-    @Inject private ClientThread clientThread;
-    @Inject private OverlayManager overlayManager;
-    @Inject private ChatOverlay chatOverlay;
-    @Inject private CyrillicTooltipOverlay tooltipOverlay;
-    @Inject private AITranslatorConfig config;
-    @Inject private DeepLTranslator translator;
-    @Inject private ContextMenuOverlay contextMenuOverlay;
-    @Inject private net.runelite.client.eventbus.EventBus eventBus;
-    @Inject private LocalGlossary localGlossary;
+    // Core runtime-injected things from RuneLite / Guice
+    @Inject
+    private Client client;
+    @Inject
+    private ClientThread clientThread;
+    @Inject
+    private OverlayManager overlayManager;
+    @Inject
+    private TranslationOverlay translationOverlay;
+    @Inject
+    private ChatOverlay chatOverlay;
+    @Inject
+    private CyrillicTooltipOverlay tooltipOverlay;
+    @Inject
+    private AITranslatorConfig config;
+    @Inject
+    private ContextMenuOverlay contextMenuOverlay;
+    @Inject
+    private net.runelite.client.eventbus.EventBus eventBus;
+    @Inject
+    private LocalGlossary localGlossary;
+    @Inject
+    private MenuTranslator menuTranslator;
+    @Inject
+    private GlossaryService glossaryService;
 
-    // Managers (may be present or null depending on your project)
-    private GlossaryService glossary;
+    // Provided / injected via the @Provides methods below
+    @Inject
     private CacheManager cacheManager;
+    @Inject
     private WidgetCollector widgetCollector;
+    @Inject
+    private DeepLTranslator translator;
+    @Inject
     private TranslationManager translationManager;
+
+    // Back-compat / optional local GlossaryService instance (kept for compatibility)
+    private GlossaryService glossary;
 
     private ScheduledExecutorService scheduler;
     private java.util.concurrent.ScheduledFuture<?> periodicSaveTask;
 
-    private volatile int tickCounter = 0;
-
-    // Original texts we changed: widgetId -> originalText (we restore on shutdown)
-    private final Map<Integer, String> geOriginalText = new HashMap<>();
-
-    // Annotation throttling / guard
-    private volatile long lastAnnotateMs = 0L;
-    private static final long ANNOTATE_THROTTLE_MS = 180L; // milliseconds
-
     @Provides
-    AITranslatorConfig provideConfig(ConfigManager configManager)
-    {
+    AITranslatorConfig provideConfig(ConfigManager configManager) {
         return configManager.getConfig(AITranslatorConfig.class);
     }
 
     @Provides
+    @Named("translator.debug")
+    boolean provideTranslatorDebug() {
+        return DEBUG;
+    }
+
+    @Provides
     @Singleton
-    LocalGlossary provideLocalGlossary()
-    {
+    LocalGlossary provideLocalGlossary() {
         return new LocalGlossary();
     }
 
-    // --- WIRING: inject MenuTranslator + GlossaryService and load glossaries on startup ---
-    @Inject private MenuTranslator menuTranslator;
-    @Inject private GlossaryService glossaryService;
+    @Provides
+    @Singleton
+    CacheManager provideCacheManager(AITranslatorConfig cfg) {
+        CacheManager cm = new CacheManager();
+        try {
+            cm.init(cfg.targetLang());
+            cm.load();
+        } catch (Exception ex) {
+            if (DEBUG) log.debug("CacheManager init/load failed: {}", ex.toString());
+        }
+        return cm;
+    }
+
+    @Provides
+    @Singleton
+    WidgetCollector provideWidgetCollector(Client client, @Named("translator.debug") boolean debug) {
+        return new WidgetCollector(client, debug);
+    }
+
+    @Provides
+    @Singleton
+    DeepLTranslator provideDeepLTranslator(AITranslatorConfig cfg, GlossaryService glossaryService, CacheManager cacheManager) {
+        return new DeepLTranslator(cfg, glossaryService, cacheManager);
+    }
+
+    @Provides
+    @Singleton
+    TranslationManager provideTranslationManager(
+            Client client,
+            ClientThread clientThread,
+            AITranslatorConfig cfg,
+            ChatOverlay chatOverlay,
+            DeepLTranslator translator,
+            GlossaryService glossaryService,
+            CacheManager cacheManager,
+            WidgetCollector widgetCollector,
+            TranslationOverlay translationOverlay,      // <-- inject overlay too
+            @Named("translator.debug") boolean debug) {
+        return new TranslationManager(
+                client,
+                clientThread,
+                translator,
+                glossaryService,
+                cacheManager,
+                translationOverlay,   // <-- pass overlay into manager
+                debug
+        );
+    }
 
     @Override
-    protected void startUp()
-    {
-        // Set package-level logger to debug during development
+    protected void startUp() {
         ch.qos.logback.classic.Logger pkg =
                 (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger("com.example");
         pkg.setLevel(ch.qos.logback.classic.Level.DEBUG);
 
+        overlayManager.add(translationOverlay);
         overlayManager.add(chatOverlay);
         overlayManager.add(tooltipOverlay);
         overlayManager.add(contextMenuOverlay);
@@ -106,61 +166,50 @@ public class AITranslatorPlugin extends Plugin
 
         log.info("AI Translator starting up...");
 
-        // Ensure glossary data is available for MenuTranslator and other consumers
-        try
-        {
+        try {
             glossaryService.loadAll();
             log.info("GlossaryService loaded: {}", glossaryService.isLoaded());
-        }
-        catch (Exception e)
-        {
+        } catch (Exception e) {
             log.warn("Failed to load glossaries: {}", e.toString());
         }
 
-        // Managers + scheduler kept minimal for this test; existing components may be initialized elsewhere
-        try
-        {
+        try {
             glossary = new GlossaryService();
-
-            log.info("Glossaries loaded into GlossaryService:");
-        }
-        catch (Exception e)
-        {
+            log.info("Glossaries loaded into GlossaryService");
+        } catch (Exception e) {
             if (DEBUG) log.debug("Glossary load failed: {}", e.toString());
         }
 
-        cacheManager = new CacheManager();
-        cacheManager.init(config.targetLang());
-        cacheManager.load();
+        scheduler = Executors.newSingleThreadScheduledExecutor();
 
-        widgetCollector = new WidgetCollector(client, DEBUG);
-        translationManager = new TranslationManager(
-                client,
-                clientThread,
-                config,
-                chatOverlay,
-                translator,
-                glossary,
-                cacheManager,
-                widgetCollector,
-                DEBUG
+        final long translationTickMs = 50L;
+        scheduler.scheduleAtFixedRate(
+                () -> clientThread.invokeLater(translationManager::tick),
+                0, translationTickMs, TimeUnit.MILLISECONDS
         );
 
-        scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(() -> clientThread.invokeLater(translationManager::tick), 0, 700, TimeUnit.MILLISECONDS);
-        periodicSaveTask = scheduler.scheduleWithFixedDelay(cacheManager::saveIfDirty, SAVE_PERIOD_SECONDS, SAVE_PERIOD_SECONDS, TimeUnit.SECONDS);
+        periodicSaveTask = scheduler.scheduleWithFixedDelay(
+                cacheManager::saveIfDirty,
+                SAVE_PERIOD_SECONDS,
+                SAVE_PERIOD_SECONDS,
+                TimeUnit.SECONDS
+        );
 
-        log.info("AI Translator started");
+        log.info("AI Translator started (translationTickMs={}ms)", translationTickMs);
     }
 
     @Override
-    protected void shutDown()
-    {
-        // Restore any modified widget texts before quitting
+    protected void shutDown() {
+        if (periodicSaveTask != null) {
+            periodicSaveTask.cancel(false);
+            periodicSaveTask = null;
+        }
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+            scheduler = null;
+        }
 
-        if (periodicSaveTask != null) { periodicSaveTask.cancel(false); periodicSaveTask = null; }
-        if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
-
+        overlayManager.remove(translationOverlay);
         overlayManager.remove(chatOverlay);
         overlayManager.remove(tooltipOverlay);
         overlayManager.remove(contextMenuOverlay);
@@ -168,14 +217,21 @@ public class AITranslatorPlugin extends Plugin
         eventBus.unregister(this);
 
         if (translationManager != null) translationManager.clearState();
+        if (cacheManager != null) cacheManager.saveNow();
 
         log.info("AI Translator stopped");
     }
-    // ------------------- Event handlers -------------------
 
     @Subscribe
-    public void onClientTick(ClientTick evt)
-    {
-        tickCounter++;
+    public void onScriptPostFired(ScriptPostFired event) {
+        int scriptId = event.getScriptId();
+
+        // Keep your dedupe logic here if needed
+        if (!translationManager.shouldProcessScript(scriptId)) {
+            return;
+        }
+        if (DEBUG) log.debug("Script {} fired, running widget collector → translation manager", scriptId);
+
+        translationManager.processRelevantWidgets(widgetCollector, scriptId);
     }
 }
